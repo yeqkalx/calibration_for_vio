@@ -1,4 +1,4 @@
-#!/home/kxy/miniforge3/envs/vins/bin/python
+#!/usr/bin/env python3
 """棋盘格离线内参标定。默认参数集中在同目录 calibration_config.py。"""
 import argparse
 import json

@@ -2,12 +2,12 @@
 """IMU 噪声分析（Allan 方差）—— 静置数据 → OpenVINS / Kalibr 噪声参数。
 
 怎么用（PyCharm 里直接点绿三角）:
-    python analyze_static_noise.py                  # 自动取 imu/data/ 里最新的 CSV
+    python analyze_static_noise.py                  # 自动取 imu_noise/data/ 里最新的 CSV
     python analyze_static_noise.py 某个文件.csv      # 指定 CSV
     python analyze_static_noise.py log_8.bin        # 也能读飞控 DataFlash 日志（交叉验证用）
     python analyze_static_noise.py --skip-selfcheck # 跳过合成自检（不建议）
 
-输出（到 imu/results/<时间戳>/）:
+输出（到 imu_noise/results/<时间戳>/）:
     allan_gyro.png / allan_accel.png     Allan 偏差曲线 + 拟合线
     noise_results.json                   全部数字（含拟合窗口、R²、判据）
     kalibr_imu_chain.yaml                可直接给 OpenVINS 的配置
@@ -49,7 +49,7 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE
 VENDOR = HERE / "vendor"
 sys.path.insert(0, str(VENDOR))
 from allan import allan_deviation, tau_grid  # noqa: E402

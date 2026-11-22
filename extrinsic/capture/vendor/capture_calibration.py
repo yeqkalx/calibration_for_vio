@@ -1,4 +1,4 @@
-#!/home/kxy/miniforge3/envs/vins/bin/python
+#!/usr/bin/env python3
 """Collect mono8 calibration images from the Orbbec RGB UVC camera.
 
 Kalibr folder layout: OUTPUT/cam0/<host_wall_clock_nanoseconds>.png

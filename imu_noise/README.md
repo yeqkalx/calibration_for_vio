@@ -8,9 +8,9 @@
 
 ```
 第 1 步   飞控平放桌上，USB 供电，不接电机不装桨
-          → 点 src/record_static_imu.py        （默认录 8 小时）
+          → 点 record_static_imu.py        （默认录 8 小时）
 
-第 2 步   点 src/analyze_static_noise.py        （自动找最新的 CSV）
+第 2 步   点 analyze_static_noise.py        （自动找最新的 CSV）
           → 出图 + noise_results.json + kalibr_imu_chain.yaml
 
 第 3 步   把 kalibr_imu_chain.yaml 覆盖到：
@@ -54,12 +54,12 @@ Kalibr / OpenVINS 的 `*_noise_density` 描述的**正是这条流**。
 
 | 文件 | 作用 |
 |---|---|
-| `src/record_static_imu.py` | 录 8 小时静置数据 → `data/static_<时间戳>.csv` |
-| `src/analyze_static_noise.py` | Allan 分析 → 图 + JSON + YAML |
-| `src/vendor/` | 逐字节拷贝的已验证模块（`allan.py` / `logparse.py` / `mavlink_min.py`），见其中的 `PROVENANCE.md` |
+| `record_static_imu.py` | 录 8 小时静置数据 → `data/static_<时间戳>.csv` |
+| `analyze_static_noise.py` | Allan 分析 → 图 + JSON + YAML |
+| `serial_port.py` | 跨平台串口与 MAVLink 端口自动探测 |
+| `vendor/` | 已验证模块（`allan.py` / `logparse.py` / `mavlink_min.py`） |
 | `IMU噪声测试方案.md` | 现状盘点 + 证据链 + 补测方案 |
 | `噪声参数约定.md` | **`noise_density` 到底是什么量** —— 附三条源码级证据 |
-| `src/analyze_noise.py` | ⚠️ **旧的、坏掉的脚本**（调用未定义的 `analyze_group`），已被 `analyze_static_noise.py` 取代，留着做参考 |
 
 ---
 

@@ -11,6 +11,7 @@ extrinsic/bags/
 extrinsic/vio_out/
 intrinsic/data/
 imu_noise/data/
+imu_noise/results/
 imu_accel/data/
 *.bag
 

@@ -13,8 +13,8 @@
     python record_static_imu.py --probe     # 只探 5 秒，确认链路通不通
 
 输出:
-    imu/data/static_YYYYmmdd_HHMMSS.csv     host_ns,fc_time_us,ax,ay,az,gx,gy,gz
-    imu/data/static_YYYYmmdd_HHMMSS.meta.json
+    imu_noise/data/static_YYYYmmdd_HHMMSS.csv     host_ns,fc_time_us,ax,ay,az,gx,gy,gz
+    imu_noise/data/static_YYYYmmdd_HHMMSS.meta.json
 
 设计要点（每条都是踩过坑换来的）:
   * 【流式写盘】旧版把样本堆在内存 list 里，8 小时 = 576 万个对象 ≈ 2 GB，会炸。
@@ -48,7 +48,7 @@ REQUEST_HZ = 200.0      # 向飞控请求 HIGHRES_IMU 的速率
 # ==========================================================================
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent                       # ~/calib/imu
+ROOT = HERE                              # imu_noise/
 OUT_DIR = ROOT / "data"
 VENDOR = HERE / "vendor"
 
@@ -92,7 +92,10 @@ class Recorder:
         )
         self.instances = set()
         self._parser = MavlinkParser()
-        self._target = (1, 1)
+        self._target = None
+        self._version = 2
+        self._next_heartbeat = 0.0
+        self._next_req = 0.0
         self._last_time_usec = None
         self._last_host_ns = None
         self._fc_first_us = None
@@ -110,10 +113,12 @@ class Recorder:
             print(f"\n  ✅ 串口已打开 {self.port}（USB CDC，波特率设置无实际作用）")
             print(f"  正在请求 HIGHRES_IMU @ {self.request_hz:g} Hz ……")
             n_seq = 0
-            t_next_flush = time.monotonic() + FLUSH_EVERY_S
-            t_next_fsync = time.monotonic() + FSYNC_EVERY_S
-            t_next_progress = time.monotonic() + PROGRESS_EVERY_S
-            t_next_req = 0.0
+            t_open = time.monotonic()
+            t_next_flush = t_open + FLUSH_EVERY_S
+            t_next_fsync = t_open + FSYNC_EVERY_S
+            t_next_progress = t_open + PROGRESS_EVERY_S
+            self._next_heartbeat = 0.0
+            self._next_req = 0.0
 
             try:
                 while not self.stop:
@@ -122,10 +127,20 @@ class Recorder:
                         print("\n  ⏰ 到达设定时长，正常结束")
                         break
 
-                    # 每 2 秒重发一次 SET_MESSAGE_INTERVAL：飞控重启/换口后能自愈
-                    if now >= t_next_req:
-                        n_seq = self._request_interval(port, n_seq)
-                        t_next_req = now + 2.0
+                    # 收到飞控 HEARTBEAT 后按同一 MAVLink 版本（v1/v2）发 GCS 心跳和速率请求；
+                    # 若超过 0.5 s 仍未收到心跳，兜底向 (1, 1) 发一次请求。
+                    if self._target is not None:
+                        if now >= self._next_heartbeat:
+                            n_seq = self._send_heartbeat(port, n_seq)
+                            if self._next_heartbeat == 0.0:
+                                self._next_req = now + 0.35
+                            self._next_heartbeat = now + 1.0
+                        if now >= self._next_req:
+                            n_seq = self._request_interval(port, n_seq, self._target)
+                            self._next_req = now + 2.0
+                    elif now - t_open >= 0.5 and now >= self._next_req:
+                        n_seq = self._request_interval(port, n_seq, (1, 1))
+                        self._next_req = now + 2.0
 
                     try:
                         data = port.read(8192)
@@ -137,7 +152,9 @@ class Recorder:
                         if port is None:
                             print("  ✗ 重连失败，停止录制（已录数据已保存）")
                             break
-                        t_next_req = 0.0
+                        t_open = time.monotonic()
+                        self._next_heartbeat = 0.0
+                        self._next_req = 0.0
                         data = b""
                     if data:
                         self._consume(data, writer)
@@ -161,7 +178,17 @@ class Recorder:
         self.stats["wall_seconds"] = time.time() - t_start
 
     # ---- 内部 ----
-    def _request_interval(self, port, n_seq: int) -> int:
+    def _send_heartbeat(self, port, n_seq: int) -> int:
+        try:
+            port.write(pack(0, {
+                "type": 6, "autopilot": 8,
+                "system_status": 4, "mavlink_version": 3,
+            }, sysid=255, compid=190, seq=n_seq & 0xFF, version=self._version))
+            return n_seq + 1
+        except Exception:                                                # noqa: BLE001
+            return n_seq
+
+    def _request_interval(self, port, n_seq: int, target: tuple[int, int]) -> int:
         try:
             port.write(pack(76, {
                 "param1": float(MSG_HIGHRES_IMU),
@@ -169,9 +196,9 @@ class Recorder:
                 "param3": 0.0, "param4": 0.0, "param5": 0.0,
                 "param6": 0.0, "param7": 0.0,
                 "command": MAV_CMD_SET_MESSAGE_INTERVAL,
-                "target_system": self._target[0], "target_component": self._target[1],
+                "target_system": target[0], "target_component": target[1],
                 "confirmation": 0, "unused1": 0, "unused2": 0, "unused3": 0,
-            }, sysid=255, compid=190, seq=n_seq & 0xFF))
+            }, sysid=255, compid=190, seq=n_seq & 0xFF, version=self._version))
             return n_seq + 1
         except Exception:                                                # noqa: BLE001
             return n_seq
@@ -184,6 +211,8 @@ class Recorder:
             try:
                 new_port = open_port(self.port, self.baud)
                 self._parser = MavlinkParser()      # 残帧状态清掉
+                self._target = None
+                self._version = 2
                 self.stats["reconnects"] += 1
                 print(f"  ✅ 第 {attempt} 次重连成功（缝隙已记录）")
                 return new_port
@@ -198,8 +227,14 @@ class Recorder:
         if not frames:
             return
         for frame in frames:
+            source = (frame.sysid, frame.compid)
             if frame.name == "HEARTBEAT" and frame.compid == 1:
-                self._target = (frame.sysid, frame.compid)
+                if (source, frame.version) != (self._target, self._version):
+                    self._target, self._version = source, frame.version
+                    self._next_heartbeat = 0.0
+            elif self._target is None and frame.name == "HIGHRES_IMU":
+                self._target, self._version = source, frame.version
+                self._next_heartbeat = 0.0
 
         hi = [f for f in frames if f.name == "HIGHRES_IMU"]
         self.stats["frames_other"] += len(frames) - len(hi)
