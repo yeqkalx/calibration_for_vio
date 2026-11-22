@@ -1,3 +1,10 @@
+# 2026-11-22 独立仓库拆分与采集链路同步
+
+- 本仓库由 `pure-uav` 的 `src/vio/{extrinsic,intrinsic,imu_noise,imu_accel}` 拆分为独立仓库，原始标定工作区为 `/home/kxy/calib`。
+- `capture/` 采集链路同步到标定工作区 2026-11-22 最新版本：MAVLink 1/2 混合流解析与 `COMMAND_ACK`、IMU 启动丢弃、标定测光"最低门槛/目标值"区分、采集后自动求解，并补回 `tests/test_record_session.py`。
+- 适配独立仓库布局：720p / 640×480 内参改用仓内 `configs/` 文件；`make_rosbag.py` 默认输出到 `extrinsic/bags/`；`kalibr/run_kalibr.py` 改为挂载 `extrinsic/`、数据目录用 `extrinsic/data/`。
+- 重新生成 `MANIFEST.sha256`：覆盖标定核心代码与配置，不再包含未迁移的 `validation/` 证据目录。
+
 # 2026-10-18 检出空洞：自动选窗 + 可执行诊断
 
 - 修复"每个 session 都报大空洞"的结构性原因：检测抽样与求解抽样解耦。新增 `detect_rate_hz`（默认 0 = 每帧都检测），`camera_rate_hz` 只在检出通过 PnP 之后抽稀。实测 session11：30.15fps 原流按 15Hz 预抽帧，把 5.36s 的连续可用段切成 4.73s，低于 `min_duration_s` 就被误判成"整段没有可用窗口"。

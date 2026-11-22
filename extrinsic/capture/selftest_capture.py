@@ -93,6 +93,18 @@ def test_parser():
         check("字段名与数值正确", ok,
               f"zacc={f['zacc']} fields_updated={f['fields_updated']} time_usec={f['time_usec']}")
 
+    parser = MavlinkParser()
+    wire = pack(105, payload, sysid=1, compid=1, seq=1, version=1)
+    ack = pack(77, {"command": 511, "result": 0}, sysid=1, compid=1, seq=2, version=1)
+    check("MAVLink 1 半帧留待下次解析", not parser.feed(wire[:12]))
+    frames = parser.feed(wire[12:] + ack + pack(0, {"mavlink_version": 3}, seq=3))
+    check("MAVLink 1/2 混合流", [(frame.name, frame.version) for frame in frames]
+          == [("HIGHRES_IMU", 1), ("COMMAND_ACK", 1), ("HEARTBEAT", 2)])
+    check("MAVLink 1 IMU 和 ACK 基础字段", len(frames) >= 2 and len(frames[0].payload) == 62
+          and frames[0].fields["time_usec"] == payload["time_usec"]
+          and frames[0].fields["fields_updated"] == 0x3F
+          and frames[1].fields["command"] == 511 and frames[1].fields["result"] == 0)
+
 
 # --------------------------------------------------------------------------
 # 2. 记录器全链路 —— 伪终端当假飞控

@@ -570,30 +570,34 @@ def auto_expose(cap, fd, args, log=print):
     log(f"  锁定：曝光 {best['exposure']}（{best['exposure'] * 0.1:.1f} ms）"
         f"增益 {best['gain']} → 灰度 {best['mean']:.1f}")
 
+    if best["mean"] < args.auto_expose_min_mean:
+        if args.allow_dark:
+            log(f"⚠️ 只能到灰度 {best['mean']:.1f}（低于 {args.auto_expose_min_mean:g}），"
+                "是 --allow-dark 才继续的 —— 不建议使用这批数据")
+            evidence["status"] = "too_dark_allowed"
+            return True, evidence
+        evidence["status"] = "too_dark"
+        return False, evidence
+
     # 【2026-10-21】曝光/增益都顶满才勉强够亮 = 场地光不够。session29 就是这样过的关
     # （曝光 18 ms、增益 100、灰度只有 49.5，而门槛 45），结果尺度偏 5 倍。
     exp_pinned = exp_max >= int(round(min(_blur_ms, args.auto_expose_max_exposure_ms) * 10)) - exp_range["step"]
     gain_pinned = best["gain"] >= gain_max
     if (exp_pinned and gain_pinned and best["mean"] < target
-            and not args.allow_blur and not args.allow_dark):
+            and not args.allow_blur and not args.allow_dark and not args.allow_below_exposure_target):
         log(f"❌ 曝光和增益都顶到上限（{best['exposure'] * 0.1:.2f} ms / 增益 {best['gain']}）"
             f"才到灰度 {best['mean']:.1f}，离目标 {target:.0f} 差得远 —— 光不够。")
-        log(f"   这样录下去运动模糊会超过 {_budget_px:g} px，KLT 跟踪会崩"
-            f"（实测存活率会从 80% 掉到 40% 以下）。")
+        log("   已没有曝光/增益余量；请补光后再录制。")
         log("   加灯，或者把 AUTO_EXPOSE_EXPECTED_RATE_DPS 调低到你的真实角速度。")
         evidence["status"] = "insufficient_light"
         evidence["exp_pinned"] = True
         evidence["gain_pinned"] = True
         return False, evidence
 
-    if best["mean"] < args.auto_expose_min_mean:
-        if args.allow_dark:
-            log(f"⚠️ 只能到灰度 {best['mean']:.1f}（低于 {args.auto_expose_min_mean}），"
-                "是 --allow-dark 才继续的 —— 这种亮度的数据大概率发散")
-            evidence["status"] = "too_dark_allowed"
-            return True, evidence
-        evidence["status"] = "too_dark"
-        return False, evidence
+    if best["mean"] < target and args.allow_below_exposure_target:
+        log(f"⚠️ 灰度 {best['mean']:.1f} 未达到目标 {target:g}，但已达到最低门槛 "
+            f"{args.auto_expose_min_mean:g}；继续做曝光验证和标定板检测。")
+        evidence["status"] = "below_target"
     return True, evidence
 
 
@@ -728,6 +732,8 @@ def arguments(argv=None):
     parser.add_argument("--auto-expose-min-mean", type=float,
                         default=config.AUTO_EXPOSE_MIN_MEAN,
                         help="测光最好也只能到这个灰度以下时，拒绝采集")
+    parser.add_argument("--allow-below-exposure-target", action="store_true",
+                        help="标定模式允许灰度低于目标，但仍须达到最低门槛")
     parser.add_argument("--auto-expose-max-exposure-ms", type=float,
                         default=config.AUTO_EXPOSE_MAX_EXPOSURE_MS,
                         help="曝光绝对上限（毫秒）。真正的模糊约束请看下面三项")
@@ -920,11 +926,12 @@ def main(argv=None):
         if args.auto_expose:
             ok, auto = auto_expose(cap, fd, args)
             if not ok:
-                raise RuntimeError(
-                    f"测光失败：曝光和增益都到顶，也只能到灰度 {auto.get('achieved_mean')}"
-                    f"（门槛 {args.auto_expose_min_mean:g}）。这个亮度下特征会断崖式消失"
-                    "（session25/26/27 就是），录了也是白录。换更亮的时段/位置，或者加灯；"
-                    "确认要硬录可加 --allow-dark。")
+                mean = auto["achieved_mean"]
+                if auto["status"] == "too_dark":
+                    reason = f"灰度 {mean:g} 低于最低门槛 {args.auto_expose_min_mean:g}"
+                else:
+                    reason = f"曝光和增益已到上限，灰度 {mean:g} 未达到目标 {args.auto_expose_target:g}"
+                raise RuntimeError(f"测光失败：{reason}。请给拍摄区域均匀补光再试。")
             # 后续验证和 manifest 都以测光选出的值为准
             args.exposure = int(auto.get("exposure", args.exposure))
             args.gain = int(auto.get("gain", args.gain))

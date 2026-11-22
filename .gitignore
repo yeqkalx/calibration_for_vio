@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+
+# 运行产物：数据 / 采集结果 / bag / 输出
+extrinsic/data/
+extrinsic/results/session*/
+extrinsic/bags/
+extrinsic/vio_out/
+intrinsic/data/
+imu_noise/data/
+imu_accel/data/
+*.bag
+
+# 采集自检临时目录
+extrinsic/capture/_selftest_tmp/

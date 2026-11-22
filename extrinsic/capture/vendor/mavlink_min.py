@@ -191,7 +191,8 @@ def _packed_size(fmt: str) -> int:
 
 
 def _define(msgid: int, name: str, fields: list[tuple[str, str]],
-            crc_extra: int, expect_len: int, defaults: dict | None = None) -> None:
+            crc_extra: int, expect_len: int, defaults: dict | None = None,
+            *, extensions: int = 0) -> None:
     """Register a message.
 
     `expect_len` is the MAVLink-defined payload length.  It is asserted rather
@@ -205,7 +206,11 @@ def _define(msgid: int, name: str, fields: list[tuple[str, str]],
     target_system = 0 is dropped by the autopilot without any error, so a
     parameter query simply returns nothing and looks like "no such parameter".
     """
-    fmt, names = _wire_format(fields)
+    base = fields[:-extensions] if extensions else fields
+    tail = fields[-extensions:] if extensions else []
+    fmt, names = _wire_format(base)
+    fmt += "".join(token for _, token in tail)
+    names.extend(field_name for field_name, _ in tail)
     got = _packed_size(fmt)
     assert len(names) == len(_flatten_fmt(fmt)), f"{name}: format/name mismatch"
     assert got == expect_len, f"{name}: payload {got} bytes, expected {expect_len}"
@@ -248,7 +253,8 @@ _define(22, "PARAM_VALUE", [
 # Wire order: id u16, severity u8, chunk_seq u8, text char[50].
 # 2 + 1 + 1 + 50 = 54.  (An earlier "expected" of 51 was simply misremembered.)
 _define(253, "STATUSTEXT", [
-    ("severity", "B"), ("text", "50s"), ("id", "H"), ("chunk_seq", "B")], 83, 54)
+    ("severity", "B"), ("text", "50s"), ("id", "H"), ("chunk_seq", "B")], 83, 54,
+    extensions=2)
 
 _define(148, "AUTOPILOT_VERSION", [
     ("capabilities", "Q"), ("uid", "Q"), ("flight_sw_version", "I"),
@@ -278,7 +284,7 @@ _define(27, "RAW_IMU", [
     ("xacc", "h"), ("yacc", "h"), ("zacc", "h"),
     ("xgyro", "h"), ("ygyro", "h"), ("zgyro", "h"),
     ("xmag", "h"), ("ymag", "h"), ("zmag", "h"),
-    ("id", "B"), ("temperature", "h")], 144, 29)
+    ("id", "B"), ("temperature", "h")], 144, 29, extensions=2)
 
 # SCALED_IMU (26) / 2 (116) / 3 (129): 4 (ms) + 10*2 (int16) = 24.
 _SCALED = [
@@ -330,10 +336,12 @@ _define(76, "COMMAND_LONG", [
 # COMMAND_ACK: 4 (i result_param2) + 2 (H command) + 4*1 (B) = 10.
 _define(77, "COMMAND_ACK", [
     ("command", "H"), ("result", "B"), ("progress", "B"),
-    ("result_param2", "i"), ("target_system", "B"), ("target_component", "B")], 143, 10)
+    ("result_param2", "i"), ("target_system", "B"), ("target_component", "B")], 143, 10,
+    extensions=4)
 
 _CRC_EXTRA = {mid: v[3] for mid, v in MESSAGES.items()}
 _NAME_TO_ID = {v[0]: mid for mid, v in MESSAGES.items()}
+_V1_PAYLOAD_LEN = {26: 22, 27: 26, 77: 3, 105: 62, 116: 22, 129: 22, 253: 51}
 
 
 @dataclass
@@ -345,6 +353,7 @@ class Frame:
     seq: int
     payload: bytes
     fields: dict = field(default_factory=dict)
+    version: int = 2
 
 
 def _decode_fields(msgid: int, payload: bytes) -> dict:
@@ -394,11 +403,7 @@ def _decode_fields(msgid: int, payload: bytes) -> dict:
 
 
 class MavlinkParser:
-    """Incremental byte-stream parser.  Feed it bytes, get Frames back.
-
-    Resynchronises by scanning for the next 0xFD after a bad checksum, which is
-    what makes it usable on a noisy serial link.
-    """
+    """Incremental MAVLink 1/2 parser that resynchronises after bad frames."""
 
     def __init__(self, *, verify_crc: bool = True) -> None:
         self.buf = bytearray()
@@ -410,36 +415,40 @@ class MavlinkParser:
         out: list[Frame] = []
 
         while True:
-            start = self.buf.find(MAGIC_V2)
-            if start < 0:
-                # keep at most a byte, everything before is garbage
-                if len(self.buf) > 1:
-                    del self.buf[:-1]
+            starts = [index for magic in (MAGIC_V1, MAGIC_V2)
+                      if (index := self.buf.find(magic)) >= 0]
+            if not starts:
+                self.buf.clear()
                 break
+            start = min(starts)
             if start > 0:
                 del self.buf[:start]
-            if len(self.buf) < 12:
-                break  # need a full header
+            v1 = self.buf[0] == MAGIC_V1
+            header_len = 6 if v1 else 10
+            if len(self.buf) < header_len:
+                break
 
             plen = self.buf[1]
-            total = 10 + plen + 2
-            if plen > 255 or total > 280:
-                del self.buf[0]  # bogus length, resync
+            checksum_at = header_len + plen
+            total = checksum_at + 2 + (13 if not v1 and self.buf[2] & 1 else 0)
+            msgid = self.buf[5] if v1 else int.from_bytes(self.buf[7:10], "little")
+            extra = _CRC_EXTRA.get(msgid)
+            if extra is None:
+                self.stats["unknown_msgid"] += 1
+                del self.buf[0]
+                continue
+            max_payload = _packed_size(MESSAGES[msgid][1])
+            if v1 and plen != _V1_PAYLOAD_LEN.get(msgid, max_payload):
+                del self.buf[0]
                 continue
             if len(self.buf) < total:
-                break  # wait for the rest
+                break
 
             frame = bytes(self.buf[:total])
-            msgid = frame[7] | (frame[8] << 8) | (frame[9] << 16)
 
             if self.verify_crc:
-                extra = _CRC_EXTRA.get(msgid)
-                if extra is None:
-                    self.stats["unknown_msgid"] += 1
-                    del self.buf[0]
-                    continue
-                want = frame[total - 2] | (frame[total - 1] << 8)
-                if x25_crc(frame[1 : 10 + plen], extra) != want:
+                want = int.from_bytes(frame[checksum_at:checksum_at + 2], "little")
+                if x25_crc(frame[1:checksum_at], extra) != want:
                     self.stats["crc_bad"] += 1
                     del self.buf[0]
                     continue
@@ -447,11 +456,13 @@ class MavlinkParser:
             del self.buf[:total]
             self.stats["frames"] += 1
             name = MESSAGES[msgid][0]
+            seq, sysid, compid = frame[2:5] if v1 else frame[4:7]
+            payload = frame[header_len:checksum_at]
             out.append(
                 Frame(
-                    msgid=msgid, name=name, sysid=frame[5], compid=frame[6],
-                    seq=frame[4], payload=frame[10 : 10 + plen],
-                    fields=_decode_fields(msgid, frame[10 : 10 + plen]),
+                    msgid=msgid, name=name, sysid=sysid, compid=compid,
+                    seq=seq, payload=payload, fields=_decode_fields(msgid, payload),
+                    version=1 if v1 else 2,
                 )
             )
         return out
@@ -469,8 +480,9 @@ def pack(
     sysid: int = 255,
     compid: int = 190,
     seq: int = 0,
+    version: int = 2,
 ) -> bytes:
-    """Build a MAVLink v2 frame for one of the messages in MESSAGES.
+    """Build a MAVLink 1 or 2 frame for one of the messages in MESSAGES.
 
     Field values are coerced to the declared type and range-clamped rather than
     passed straight to struct.pack.  A MAVLink caller routinely has to put a
@@ -499,7 +511,13 @@ def pack(
         ordered.append(v)
     payload = struct.pack(fmt, *ordered)
 
-    hdr = bytes([MAGIC_V2, len(payload), 0, 0, seq & 0xFF, sysid & 0xFF, compid & 0xFF,
-                 msgid & 0xFF, (msgid >> 8) & 0xFF, (msgid >> 16) & 0xFF])
+    if version == 1 and 0 <= msgid <= 255:
+        payload = payload[:_V1_PAYLOAD_LEN.get(msgid, len(payload))]
+        hdr = bytes([MAGIC_V1, len(payload), seq & 0xFF, sysid & 0xFF, compid & 0xFF, msgid])
+    elif version == 2:
+        hdr = bytes([MAGIC_V2, len(payload), 0, 0, seq & 0xFF, sysid & 0xFF, compid & 0xFF,
+                     msgid & 0xFF, (msgid >> 8) & 0xFF, (msgid >> 16) & 0xFF])
+    else:
+        raise ValueError(f"Invalid MAVLink version {version} for message {msgid}")
     crc = x25_crc(hdr[1:] + payload, extra)
     return hdr + payload + bytes([crc & 0xFF, (crc >> 8) & 0xFF])

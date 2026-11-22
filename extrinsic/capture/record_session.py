@@ -1,11 +1,11 @@
-"""★ 外参标定采集 —— PyCharm 右上角绿三角直接运行这个文件，不需要任何命令行参数。
+"""相机–IMU 采集和外参标定。PyCharm 直接运行此文件，不需要命令行参数。
 
 它做五件事：
   1) 体检：相机在不在、飞控串口在不在、标定板配置和内参分辨率对不对
-  2) 先起 IMU 录制线程，再拉起相机采集子进x`程（两个都用宿主机 CLOCK_REALTIME → 天然同源）
+  2) 先起 IMU 录制线程，再拉起相机采集子进程（时间戳统一到宿主机 CLOCK_REALTIME）
   3) 相机跑完 → 收 IMU → 写 imu.csv
   4) capture_manifest.json → images.csv
-  5) 打印这次数据的体检报告 + 下一步该点哪个文件
+  5) 打印采集体检；标定模式下自动用两份 CSV 求解外参
 
 相机那半段用的是 vendor/capture_calibration.py（原样复制的、已经跑过好几轮内参的脚本），
 不重写、不魔改。所有可调参数都在 capture_config.py。
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -30,6 +31,10 @@ import make_images_csv                              # noqa: E402
 
 VENDOR = HERE / "vendor"
 CAMERA_SCRIPT = VENDOR / "capture_calibration.py"
+
+
+def auto_calibration_enabled():
+    return cfg.CAPTURE_PURPOSE == "calibration" and cfg.RUN_CALIBRATION_AFTER
 
 
 def hr(title=""):
@@ -171,7 +176,8 @@ def preflight():
     print("[3/4] 检查内参与标定板……")
     if not Path(cfg.CAMERA_YAML).is_file():
         raise RuntimeError(f"内参文件不存在：{cfg.CAMERA_YAML}")
-    from calib.data import Camera
+    from calib.data import Camera, Target, read_yaml
+    from extrinsics_config import SETTINGS
     cam = Camera.load(cfg.CAMERA_YAML)
     if tuple(cam.size) != (cfg.WIDTH, cfg.HEIGHT):
         raise RuntimeError(
@@ -181,6 +187,12 @@ def preflight():
 
     if not Path(cfg.TARGET_YAML).is_file():
         raise RuntimeError(f"标定板文件不存在：{cfg.TARGET_YAML}")
+    if cfg.CAPTURE_PURPOSE == "calibration":
+        target = Target(read_yaml(cfg.TARGET_YAML), min_tags=SETTINGS.min_tags,
+                        april_corner_window_px=SETTINGS.april_corner_window_px)
+        if target.kind == "aprilgrid" and target.rows * target.cols < target.min_tags:
+            raise RuntimeError(f"整块 AprilGrid 的 tag 总数少于每帧检出下限 {target.min_tags}。"
+                               "请核对板子行列数及 extrinsics_config.py 的 min_tags。")
     board = read_target(cfg.TARGET_YAML)
     print(f"  ✅ 标定板 {board['label']}")
     if board["kind"] in ("checkerboard", "chessboard"):
@@ -195,16 +207,18 @@ def preflight():
     print("[4/4] 检查目录……")
     session_dir = Path(cfg.SESSION_DIR)
     if session_dir.exists() and any(session_dir.iterdir()):
-        if not cfg.REUSE_EXISTING_SESSION:
+        if auto_calibration_enabled() or not cfg.REUSE_EXISTING_SESSION:
             raise RuntimeError(
-                f"{session_dir} 里已经有东西了。把 capture_config.py 的 SESSION_NAME 改成 "
-                "session02/03…，或把 REUSE_EXISTING_SESSION 设成 True 才允许复用。")
+                f"采集目录 {session_dir} 非空。请在 capture_config.py 改用新的 SESSION_NAME。")
         print("  ⚠️ 复用已有目录（REUSE_EXISTING_SESSION=True）")
-    session_dir.mkdir(parents=True, exist_ok=True)
     results_dir = Path(cfg.RESULTS_DIR)
     if results_dir.exists() and any(results_dir.iterdir()):
+        if auto_calibration_enabled():
+            raise RuntimeError(
+                f"标定结果目录 {results_dir} 非空。请在 capture_config.py 改用新的 SESSION_NAME。")
         print(f"  ⚠️ 结果目录 {results_dir} 非空 —— 标定程序会拒绝往里写，"
               "换个 SESSION_NAME 或把旧结果移走。")
+    session_dir.mkdir(parents=True, exist_ok=True)
     print(f"  ✅ {session_dir}")
 
     return device, port, board
@@ -213,6 +227,30 @@ def preflight():
 # --------------------------------------------------------------------------
 # 采集
 # --------------------------------------------------------------------------
+
+def camera_exposure_args():
+    from calib.data import Camera
+
+    calibration = cfg.CAPTURE_PURPOSE == "calibration"
+    expected_rate = (cfg.CALIBRATION_AUTO_EXPOSE_EXPECTED_RATE_DPS
+                     if calibration else cfg.AUTO_EXPOSE_EXPECTED_RATE_DPS)
+    focal_px = float(Camera.load(cfg.CAMERA_YAML).params[0])
+    args = ["--auto-expose" if cfg.AUTO_EXPOSE else "--no-auto-expose",
+            "--auto-expose-max-exposure-ms", str(cfg.AUTO_EXPOSE_MAX_EXPOSURE_MS),
+            "--auto-expose-target", str(cfg.AUTO_EXPOSE_TARGET),
+            "--auto-expose-min-mean", str(cfg.AUTO_EXPOSE_MIN_MEAN),
+            "--auto-expose-blur-budget-px", str(cfg.AUTO_EXPOSE_BLUR_BUDGET_PX),
+            "--auto-expose-expected-rate-dps", str(expected_rate),
+            "--focal-px", str(focal_px),
+            "--auto-expose-max-gain", str(cfg.AUTO_EXPOSE_MAX_GAIN)]
+    if calibration:
+        args.append("--allow-below-exposure-target")
+    if cfg.ALLOW_DARK:
+        args.append("--allow-dark")
+    if cfg.SKIP_EXPOSURE_CHECK:
+        args.append("--skip-exposure-check")
+    return args
+
 
 def camera_command(device, target_info):
     cols, rows = target_info["cols"], target_info["rows"]
@@ -236,13 +274,7 @@ def camera_command(device, target_info):
         "--auto-interval", f"{0.5 / cfg.FPS:.6f}",
         "--max-images", "0",
         "--duration", str(cfg.DURATION_S),
-        "--auto-expose-max-exposure-ms", str(cfg.AUTO_EXPOSE_MAX_EXPOSURE_MS),
-        "--auto-expose-target", str(cfg.AUTO_EXPOSE_TARGET),
-        "--auto-expose-min-mean", str(cfg.AUTO_EXPOSE_MIN_MEAN),
-    ] + ([] if cfg.AUTO_EXPOSE else ["--no-auto-expose"]
-         ) + (["--allow-dark"] if cfg.ALLOW_DARK else []
-    ) + (["--skip-exposure-check"] if cfg.SKIP_EXPOSURE_CHECK else []
-         ) + ([] if cfg.SHOW_PREVIEW else ["--no-preview"])
+    ] + camera_exposure_args() + ([] if cfg.SHOW_PREVIEW else ["--no-preview"])
 
 
 def _pump_with_timer(proc):
@@ -349,7 +381,8 @@ def _pump_with_timer(proc):
         pass
     _clear()
     print(f"  采集结束：{saved} 张图，用时 {time.monotonic() - t0:.1f} s")
-    print("  请确认你此刻正站在起点地贴上 —— 闭环要靠这个")
+    if cfg.CAPTURE_PURPOSE == "vio":
+        print("  请确认你此刻正站在起点地贴上 —— 闭环要靠这个")
 
 
 def record(device, port, target_info):
@@ -359,19 +392,20 @@ def record(device, port, target_info):
     print(f"  相机 {device}   |   IMU {port}   |   {cfg.DURATION_S:g} 秒")
     if cfg.SHOW_PREVIEW:
         print("  预览窗口：空格手动存一张，Q 提前结束")
-    print("  接下来拿着整套设备，在标定板前做连续、平滑、多轴转动 —— 要转得够多轴，别只平移")
-    if target_info.get("kind") not in ("checkerboard", "chessboard"):
+    if cfg.CAPTURE_PURPOSE == "calibration":
+        print("  让标定板保持可见，缓慢绕三轴转动整套设备，并做一些平移。")
+    if cfg.CAPTURE_PURPOSE == "calibration" and target_info.get("kind") == "aprilgrid":
         print("  注意：下行每句末尾的 board=no 是采图脚本自带的【棋盘】检测器打的，"
               "对 AprilGrid 恒为 no，可以忽略")
     print()
 
-    recorder = imu_recorder.ImuRecorder(port, request_hz=cfg.IMU_REQUEST_HZ, baud=cfg.IMU_BAUD)
+    recorder = imu_recorder.ImuRecorder(port, request_hz=cfg.IMU_REQUEST_HZ, baud=cfg.IMU_BAUD,
+                                        startup_discard_s=cfg.IMU_STARTUP_DISCARD_S)
     recorder.start()
     print(f"  IMU 已在录，先跑 {cfg.IMU_PRIME_S:g} 秒保证两路有重叠……")
-    time.sleep(cfg.IMU_PRIME_S)
-
     proc, interrupted = None, False
     try:
+        time.sleep(cfg.IMU_PRIME_S)
         proc = subprocess.Popen(camera_command(device, target_info),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
@@ -488,7 +522,7 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
             icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(level, "•")
             print(f"  {icon} {text}")
         print("  标定板检出      跳过（这份数据是给 VIO 用的，不是内参/外参标定）")
-    elif images and board is not None:
+    elif images and board is not None and not auto_calibration_enabled():
         print()
         print("画面体检")
         health = image_health.analyze(images, cfg.TARGET_YAML, sample=20)
@@ -530,10 +564,10 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
 
     print()
     hr("结论")
-    fatal = False
+    fatal = interrupted
     if interrupted:
         print("⚠️  这次是被中断的，数据可能不完整")
-    if cam_rc not in (0, None):
+    if cam_rc != 0:
         print(f"❌ 相机采集返回码 {cam_rc} —— 看上面相机子进程打印的报错")
         fatal = True
     if imu_level == "fail":
@@ -541,8 +575,8 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
         fatal = True
     if img_stats is None:
         fatal = True
-    elif str(img_stats.get("manifest_termination") or "").startswith("failed"):
-        print(f"❌ 相机采集失败：{img_stats['manifest_termination']}")
+    elif str(img_stats.get("manifest_termination") or "").startswith(("failed", "user_interrupted")):
+        print(f"❌ 相机采集没有正常完成：{img_stats['manifest_termination']}")
         fatal = True
     elif img_stats["images"] < 35:
         print(f"❌ 图像只有 {img_stats['images']} 张，低于标定下限（35 张有效检出）")
@@ -560,46 +594,35 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
               " —— 带着这个去跑标定，只会得到「有效标定板帧只有 0」")
         print("   先点 capture/framing_check.py 把取景和曝光调对，别浪费一轮采集")
         fatal = True
-    if not fatal:
+    if not fatal and auto_calibration_enabled():
+        print("✅ 两份 CSV 就绪；接下来由求解器逐帧检测标定板并检查残差与运动激励。")
+    elif not fatal and purpose == "calibration":
         print("✅ 两份 CSV 就绪、画面过关、也有连续可用窗口 —— 可以往下标定了")
+    elif not fatal:
+        print("✅ VIO 采集的两份 CSV 就绪；不执行外参标定。")
     return fatal
 
 
-def pat_hint():
-    import extrinsics_config as ec
-    want = {"images": Path(cfg.SESSION_DIR) / "images.csv",
-            "imu": Path(cfg.SESSION_DIR) / "imu.csv",
-            "output": Path(cfg.RESULTS_DIR)}
-    hr("标定那一步的路径")
-    if all(Path(ec.PATHS[k]) == v for k, v in want.items()):
-        print("✅ extrinsics_config.py 的 PATHS 已指向本次会话 —— "
-              "直接点 calibrate_extrinsics.py 的绿三角即可。")
+def calibration_command():
+    session_dir = Path(cfg.SESSION_DIR)
+    return [sys.executable, str(ROOT / "calibrate_extrinsics.py"),
+            "--camera", str(cfg.CAMERA_YAML), "--target", str(cfg.TARGET_YAML),
+            "--images", str(session_dir / "images.csv"), "--imu", str(session_dir / "imu.csv"),
+            "--image-unit", "ns", "--imu-unit", "ns", "--output", str(cfg.RESULTS_DIR)]
+
+
+def run_calibration():
+    hr("开始外参求解 · 不再占用相机和飞控串口")
+    print(f"  使用标定板 {cfg.TARGET_YAML}", flush=True)
+    result = subprocess.run(calibration_command(), cwd=ROOT, check=False)
+    report_path = Path(cfg.RESULTS_DIR) / "report.json"
+    if result.returncode:
+        print(f"❌ 外参标定未通过（退出码 {result.returncode}）；原始采集数据已保留。")
+        if report_path.is_file():
+            print(f"   失败原因见 {report_path}")
     else:
-        print("⚠️  extrinsics_config.py 的 PATHS 还没指向本次会话。"
-              "把它最下面那几行改成：")
-        print()
-        print(f'    "images":  ROOT / "data/{cfg.SESSION_NAME}/images.csv",')
-        print(f'    "imu":     ROOT / "data/{cfg.SESSION_NAME}/imu.csv",')
-        print(f'    "output":  ROOT / "results/{cfg.SESSION_NAME}",')
-        print()
-        print(f"  （当前 images 指向 {ec.PATHS['images']}）")
-
-
-def next_steps():
-    hr("接下来点哪个")
-    print(f"  1) 打开 {ROOT / 'calibrate_extrinsics.py'}，点右上角绿三角")
-    print("     —— 它读的是 extrinsics_config.py 里的 PATHS 和 SETTINGS。")
-    print()
-    print("     冒烟测试建议先把 extrinsics_config.py 最下面这一行：")
-    print("         SETTINGS = Settings()")
-    print("     改成（一行搞定，就是 configs/probe.yaml 里那两项）：")
-    print("         SETTINGS = Settings(camera_rate_hz=30, max_imu_gap_s=0.15)")
-    print("     不用的时候改回来即可。")
-    print()
-    print(f"  2) 然后看 {Path(cfg.RESULTS_DIR) / 'extraction.json'}")
-    print("     里面逐帧有 detected 标记 —— 这就是冒烟测试的判据：")
-    print("     true 占比 >80% → 链路通了；<50% → 板子/距离/光照有问题；")
-    print("     0% → 标定板行列数或分辨率不对（iPad 那张 PNG 是 8x6，别用 8x11 去测）")
+        print(f"✅ 外参标定通过。结果和诊断见 {report_path}")
+    return result.returncode
 
 
 # --------------------------------------------------------------------------
@@ -614,7 +637,11 @@ def main():
         print(f"{exc}")
         return 2
 
-    imu_stats, cam_rc, interrupted = record(device, port, target_info)
+    try:
+        imu_stats, cam_rc, interrupted = record(device, port, target_info)
+    except (RuntimeError, OSError) as exc:
+        print(f"❌ 采集失败：{exc}")
+        return 1
 
     session_dir = Path(cfg.SESSION_DIR)
     img_stats = None
@@ -627,11 +654,17 @@ def main():
         print(f"⚠️  {session_dir}/capture_manifest.json 不存在 —— 相机一张都没存下。")
 
     fatal = report(imu_stats, cam_rc, img_stats, interrupted)
-    pat_hint()
-    next_steps()
     print()
     print(f"数据在 {session_dir}")
-    return 1 if fatal else 0
+    if fatal:
+        print("未开始外参标定。解决采集问题后，请换一个 SESSION_NAME 再录。")
+        return 1
+    if auto_calibration_enabled():
+        return run_calibration()
+    if cfg.CAPTURE_PURPOSE == "calibration":
+        print("只采集模式。若要为本次会话单独求解，可在终端运行：")
+        print(f"  {shlex.join(calibration_command())}")
+    return 0
 
 
 if __name__ == "__main__":

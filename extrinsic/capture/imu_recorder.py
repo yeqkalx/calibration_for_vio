@@ -1,4 +1,4 @@
-"""CUAV 7-Nano IMU → imu.csv（外参标定用）
+"""MAVLink 飞控 IMU → imu.csv（外参标定用）
 
 不依赖 pyserial：用内核自带的 termios + os.read，和你 `imu/src` 里那几个脚本一致。
 MAVLink 编解码用 `vendor/mavlink_min.py`（已在真实串口抓包上验证：98 帧、0 CRC 错）。
@@ -164,16 +164,18 @@ class ImuRecorder:
     _error: str = field(default="", init=False)
     _timebase: dict = field(default_factory=dict, init=False, repr=False)
     _anchored: bool = field(default=False, init=False, repr=False)
+    startup_discard_s: float = field(default=0.0, kw_only=True)
 
     # ---- 生命周期 ----
     def start(self, wait_first_s=3.0):
         self._fd = open_serial(self.port, self.baud)
         self._thread = threading.Thread(target=self._loop, name="imu-recorder", daemon=True)
         self._thread.start()
-        if wait_first_s and not self._first.wait(wait_first_s):
+        timeout = wait_first_s + self.startup_discard_s
+        if wait_first_s and not self._first.wait(timeout):
             self.stop()
             raise RuntimeError(
-                f"{self.port} 打开了但 {wait_first_s:g}s 内没收到 HIGHRES_IMU。"
+                f"{self.port} 打开了但 {timeout:g}s 内没收到可记录的 HIGHRES_IMU。"
                 "飞控在跑吗？USB 口对吗？换另一个 ttyACM 试试。")
         return self
 
@@ -211,9 +213,13 @@ class ImuRecorder:
     # ---- 线程体 ----
     def _loop(self):
         parser = MavlinkParser()
-        target = (1, 1)         # 飞控 sysid/compid，收到 HEARTBEAT 后修正
-        requested = False
-        asked_at = time.monotonic()
+        target = None
+        version = 2
+        next_heartbeat = 0.0
+        next_request = 0.0
+        ack_result = None
+        tx_seq = 0
+        record_after = time.monotonic() + self.startup_discard_s
         last_time_usec = None
         last_ts = None
         instances = set()
@@ -226,20 +232,26 @@ class ImuRecorder:
 
         try:
             while not self._stop.is_set():
-                # 每 2 秒重发一次 SET_MESSAGE_INTERVAL：飞控重启/换口后能自愈
-                if not requested or time.monotonic() - asked_at > 2.0:
+                now = time.monotonic()
+                if target is not None:
                     try:
-                        os.write(self._fd, pack(76, {
-                            "param1": float(MSG_HIGHRES_IMU),
-                            "param2": 1e6 / self.request_hz if self.request_hz > 0 else -1.0,
-                            "param3": 0.0, "param4": 0.0, "param5": 0.0,
-                            "param6": 0.0, "param7": 0.0,
-                            "command": MAV_CMD_SET_MESSAGE_INTERVAL,
-                            "target_system": target[0], "target_component": target[1],
-                            "confirmation": 0, "unused1": 0, "unused2": 0, "unused3": 0,
-                        }, sysid=255, compid=190, seq=n_frames & 0xFF))
-                        requested = True
-                        asked_at = time.monotonic()
+                        if now >= next_heartbeat:
+                            os.write(self._fd, pack(0, {"type": 6, "autopilot": 8,
+                                                       "system_status": 4, "mavlink_version": 3},
+                                                    version=version, seq=tx_seq))
+                            tx_seq += 1
+                            if next_heartbeat == 0.0:
+                                next_request = now + 0.35
+                            next_heartbeat = now + 1.0
+                        if now >= next_request:
+                            os.write(self._fd, pack(76, {
+                                "param1": float(MSG_HIGHRES_IMU),
+                                "param2": 1e6 / self.request_hz if self.request_hz > 0 else -1.0,
+                                "command": MAV_CMD_SET_MESSAGE_INTERVAL,
+                                "target_system": target[0], "target_component": target[1],
+                            }, version=version, seq=tx_seq))
+                            tx_seq += 1
+                            next_request = now + 2.0
                     except OSError as exc:
                         self._error = f"写串口失败: {exc}"
                         return
@@ -262,9 +274,19 @@ class ImuRecorder:
                 if not frames:
                     continue
                 for frame in frames:
+                    source = (frame.sysid, frame.compid)
                     if frame.name == "HEARTBEAT" and frame.compid == 1:
-                        target = (frame.sysid, frame.compid)
+                        if (source, frame.version) != (target, version):
+                            target, version = source, frame.version
+                            next_heartbeat = 0.0
+                    elif target is None and frame.name == "HIGHRES_IMU":
+                        target, version = source, frame.version
+                    elif (source == target and frame.name == "COMMAND_ACK"
+                          and frame.fields.get("command") == MAV_CMD_SET_MESSAGE_INTERVAL):
+                        ack_result = frame.fields.get("result")
 
+                if time.monotonic() < record_after:
+                    continue
                 hi = [f for f in frames if f.name == "HIGHRES_IMU"]
                 if not hi:
                     continue
@@ -322,6 +344,8 @@ class ImuRecorder:
                 interpolated=n_interpolated, decode_fail=decode_fail,
                 clamped=n_clamped,
                 instances=sorted(instances), parser_stats=dict(parser.stats),
+                mavlink_version=version if target is not None else None,
+                rate_request_ack=ack_result,
                 target=target)
 
     # ---- 统计 ----
@@ -352,6 +376,8 @@ class ImuRecorder:
         stats = {
             "port": self.port,
             "requested_hz": self.request_hz,
+            "mavlink_version": extra.get("mavlink_version"),
+            "rate_request_ack": extra.get("rate_request_ack"),
             "samples": len(self.samples),
             "frames_received": extra.get("frames", 0),
             "duplicates_skipped": extra.get("duplicates", 0),
@@ -516,7 +542,8 @@ def _main():
             print("\n  检查：飞控通电了吗？USB 线是数据线不是充电线吗？"
                   "换一个 ttyACM 试试（在 capture_config.py 里写死 IMU_PORT）。")
             return 2
-    rec = ImuRecorder(port, request_hz=cfg.IMU_REQUEST_HZ, baud=cfg.IMU_BAUD)
+    rec = ImuRecorder(port, request_hz=cfg.IMU_REQUEST_HZ, baud=cfg.IMU_BAUD,
+                      startup_discard_s=cfg.IMU_STARTUP_DISCARD_S)
     print(f"打开 {port} ……")
     rec.start()
     try:

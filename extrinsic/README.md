@@ -4,7 +4,7 @@
 
 程序借鉴 Kalibr 的连续时间联合优化思路，没有克隆、编译或调用 Kalibr。当前支持 `pinhole + radtan`、固定内参、棋盘格与 tag36h11 AprilGrid。优化旋转、平移、时间偏移、恒定陀螺仪/加计零偏、重力方向和整段样条轨迹。
 
-**开发验证与设备标定分开看**：本目录的 `validation/` 是合成数据和软件测试证据，里面的外参不是你的 Gemini Pro 与 CUAV 的实际安装外参。真实设备外参必须用实际同步采集的数据重新求解。详见 `VALIDATION.md`。
+**开发验证与设备标定分开看**：原标定工作区的 `validation/` 是合成数据和软件测试证据（约 52 MB 运行输出，未随本仓库迁移），里面的外参不是你的 Gemini Pro 与 CUAV 的实际安装外参。真实设备外参必须用实际同步采集的数据重新求解。详见 `VALIDATION.md`。
 
 ## 1. 先运行软件自检
 
@@ -12,7 +12,7 @@
 
 ```bash
 conda activate vins
-cd /path/to/camera_imu_calibration
+cd /path/to/calibration_for_vio/extrinsic
 python -m unittest discover -s tests -v
 # 含高频运动与因果滤波负对照的较长回归（最多两个求解进程）
 # python verify_review.py --output validation/my_review_run
@@ -209,4 +209,4 @@ python prepare_openvins.py \
 
 ## 10. 本次复核修订
 
-2026-10-15 修订、采纳/限定/纠正理由见 `REVIEW_RESPONSE.md`；27 项自动测试和七组数值对照见 `VALIDATION.md`。原 2026-10-13 证据保留为历史，不混作新默认配置结果。最终文件完整性可在本目录运行 `sha256sum -c MANIFEST.sha256` 检查。
+2026-10-15 修订、采纳/限定/纠正理由见 `REVIEW_RESPONSE.md`；27 项自动测试和七组数值对照见 `VALIDATION.md`。原 2026-10-13 证据保留为历史，不混作新默认配置结果。标定核心代码与配置的完整性可在本目录运行 `sha256sum -c MANIFEST.sha256` 检查（`capture/` 采集链路的副本哈希见 `capture/vendor/PROVENANCE.md`）。

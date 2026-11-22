@@ -1,5 +1,7 @@
 # 把你的标定结果喂给 OpenVINS —— 手把手
 
+> 说明：示例里的 `session05` 路径沿用 2026-10 的历史实验命名，按你当前的 `SESSION_NAME` 替换。
+
 从「采集数据」到「OpenVINS 出一条轨迹」，一共三步。
 
 ---
@@ -72,7 +74,7 @@ rospack find ov_msckf
 ### 方法 B：终端
 
 ```bash
-cd ~/calib/camera_imu_calibration
+cd extrinsic
 python capture/make_rosbag.py
 ```
 
@@ -90,7 +92,7 @@ python capture/make_rosbag.py --list
 
 ### 输出在哪
 
-默认写到 `/home/kxy/calib/rosbags/<session>.bag`。
+默认写到 `<repo>/extrinsic/bags/<session>.bag`。
 
 ### 你应该看到
 
@@ -123,7 +125,7 @@ types:       sensor_msgs/Image [060021388200f6f0f447d0fcd9c64743]
 （这是防呆，别绕过）。
 
 ```bash
-cd ~/calib/camera_imu_calibration
+cd extrinsic
 python prepare_openvins.py \
     --calibration results/session05_window \
     --template-config ~/vio_ws/final_config \
@@ -157,13 +159,13 @@ python prepare_openvins.py \
 
 ```bash
 roslaunch ov_msckf serial.launch \
-    config_path:=/home/kxy/calib/ov_config_session05/estimator_config.yaml \
-    bag:=/home/kxy/calib/rosbags/session05.bag \
+    config_path:=<repo>/extrinsic/ov_config_session05/estimator_config.yaml \
+    bag:=<repo>/extrinsic/bags/session05.bag \
     bag_start:=0 \
     max_cameras:=1 \
     use_stereo:=false \
     dosave:=true \
-    path_est:=/home/kxy/calib/vio_out/session05.txt
+    path_est:=<repo>/extrinsic/vio_out/session05.txt
 ```
 
 | 参数 | 含义 |
@@ -194,7 +196,7 @@ number of features  特征数。掉到个位数说明跟丢了
 ### 轨迹文件
 
 ```
-/home/kxy/calib/vio_out/session05.txt
+<repo>/extrinsic/vio_out/session05.txt
 ```
 
 格式（TUM 风格）：`timestamp tx ty tz qx qy qz qw`
@@ -208,7 +210,7 @@ number of features  特征数。掉到个位数说明跟丢了
 ```bash
 python3 -c "
 import numpy as np
-d = np.loadtxt('/home/kxy/calib/vio_out/session05.txt')
+d = np.loadtxt('<repo>/extrinsic/vio_out/session05.txt')
 p = d[:, 1:4]
 print('采样点', len(p))
 print('起点', p[0].round(3))
@@ -329,8 +331,8 @@ process has died [pid 15003, exit code -11, cmd .../ros1_serial_msckf]
 ```bash
 python3 - <<'PY'
 import numpy as np
-tr  = np.loadtxt("/home/kxy/calib/vio_out/session05.txt", comments="#")
-img = np.loadtxt("/home/kxy/calib/camera_imu_calibration/data/session05/images.csv",
+tr  = np.loadtxt("<repo>/extrinsic/vio_out/session05.txt", comments="#")
+img = np.loadtxt("<repo>/extrinsic/data/session05/images.csv",
                  delimiter=",", skiprows=1, usecols=0, dtype=np.int64)/1e9
 print(f"图像覆盖率 {(tr[-1,0]-img[0])/(img[-1]-img[0])*100:.1f}%")
 PY

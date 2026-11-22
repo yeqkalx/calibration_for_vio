@@ -1,14 +1,14 @@
 # vendor/ —— 现成脚本的本地副本
 
 这三个文件不是新写的，是从你已有的、已经跑过好几轮的脚本复制过来的。
-复制的原因：让 `camera_imu_calibration/` 这个 PyCharm 工程自包含，
+复制的原因：让 `extrinsic/` 这个 PyCharm 工程自包含，
 不依赖 `~/Documents/Codex/...` 那个临时目录（那个目录哪天被清理掉，采集就断了）。
 
-| 文件 | 来源 | 复制时的 SHA256 | 现在还是原版吗 |
-|---|---|---|---|
-| `capture_calibration.py` | `/home/kxy/Documents/Codex/2026-10-13/vio-1-https-github-com-ethz-2/outputs/capture_calibration.py` | `6116dc0e5939be63b755f5a5dee08537964df689f01948307fb0a22296348151` | ❌ **已改一处，见下** |
-| `calibration_config.py` | 同上目录 | `24c541221f646ae38c179fb49878b8a0506d1408c825a4e6516985b11fe0ac45` | ✅ 原版 |
-| `mavlink_min.py` | `/home/kxy/calib/camera/imu/src/mavlink_min.py` | `f7009882022682d5c78b8b6c275bea79389e7b4fae22f50bf8a150610feff24a` | ✅ 原版 |
+| 文件 | 来源 | 复制时 SHA256 | 当前 SHA256 | 说明 |
+|---|---|---|---|---|
+| `capture_calibration.py` | `/home/kxy/Documents/Codex/2026-10-13/vio-1-https-github-com-ethz-2/outputs/capture_calibration.py` | `6116dc0e5939be63b755f5a5dee08537964df689f01948307fb0a22296348151` | `8e0a43928218dbdd3651fe31461bd814b2e35189a157cbb358df7288db451268` | ❌ 已改（帧率/曝光/测光多处，见下） |
+| `calibration_config.py` | 同上目录 | `24c541221f646ae38c179fb49878b8a0506d1408c825a4e6516985b11fe0ac45` | `a88920c94d3b55f729bd0eef4943c5bec3e1e6a10ee19ce86abba87d10bc1732` | ❌ 已改（曝光测光参数，见下） |
+| `mavlink_min.py` | `/home/kxy/calib/camera/imu/src/mavlink_min.py` | `f7009882022682d5c78b8b6c275bea79389e7b4fae22f50bf8a150610feff24a` | `afa9efbb23c5dfcae1594eb26e1f0bcd07779d9107da097f9f8b1b327eafc838` | ❌ 已改（2026-11-22 MAVLink 1/2，见下） |
 
 复制日期：2026-10-15。复制时逐个 `sha256sum` 比对过，与源文件逐位一致。
 
@@ -102,9 +102,8 @@ found, corners = cv2.findChessboardCornersSB(
 
 ```bash
 cp /home/kxy/Documents/Codex/2026-10-13/vio-1-https-github-com-ethz-2/outputs/capture_calibration.py \
-   /home/kxy/calib/camera_imu_calibration/capture/vendor/capture_calibration.py
+   <repo>/extrinsic/capture/vendor/capture_calibration.py
 ```
-
 （那样帧率会退回 2.6 fps —— 除非改回 `SHOW_PREVIEW = True` 并且不在乎帧率。）
 
 ## 为什么要复制 `capture_calibration.py`
@@ -228,15 +227,23 @@ dB 一类的东西（30 ≈ +3 dB ≈ 1.4×），而相机通常支持到 +20~30
 **重新跑一遍会发生什么**：同样的场地会被**拒绝采集**（光不够）。这是正确结果 ——
 比录一段必然发散的数据好。
 
+### 2026-11-22 · 区分标定测光的最低门槛和目标值
+
+标定入口显式传入 `--allow-below-exposure-target`，允许灰度达到最低门槛但未达到目标时继续。曝光验证仍执行；默认 VIO 测光仍拒绝曝光、增益已到顶且亮度没到目标的采集。
+
+### 2026-11-22 · `mavlink_min.py` 支持 MAVLink 1/2 混合流
+
+部分飞控/串口适配器实际走 MAVLink 1。解析器现在按 magic 字节区分 v1/v2 帧头（v1 头 6 字节、v2 头 10 字节），并按 `_V1_PAYLOAD_LEN` 取 v1 的定长 payload；消息定义支持 `extensions` 扩展字段（如 `COMMAND_ACK`）。`capture/selftest_capture.py` 增加 v1 半帧续解析与 v1/v2 混合流用例，`capture/imu_recorder.py` 据此记录 `mavlink_version` 并等待/记录 `COMMAND_ACK`。
+
 ## 改了源文件怎么办
 
 源文件如果以后有 bug 修复，需要重新复制并更新上表的哈希。检查是否漂移：
 
 ```bash
-cd /home/kxy/calib/camera_imu_calibration/capture/vendor && sha256sum -c <<'EOF'
-d6146081077007fb929618e75990653da8d5c8c15d14a126f45c65f0af203936  capture_calibration.py
+cd extrinsic/capture/vendor && sha256sum -c <<'EOF'
+8e0a43928218dbdd3651fe31461bd814b2e35189a157cbb358df7288db451268  capture_calibration.py
 a88920c94d3b55f729bd0eef4943c5bec3e1e6a10ee19ce86abba87d10bc1732  calibration_config.py
-f7009882022682d5c78b8b6c275bea79389e7b4fae22f50bf8a150610feff24a  mavlink_min.py
+afa9efbb23c5dfcae1594eb26e1f0bcd07779d9107da097f9f8b1b327eafc838  mavlink_min.py
 EOF
 ```
 

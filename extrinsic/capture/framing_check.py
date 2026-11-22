@@ -87,7 +87,7 @@ def main():
         "--cols", str(board["cols"]), "--rows", str(board["rows"]),
         "--auto-interval", "0.2", "--max-images", "0",
         "--duration", str(SECONDS),
-    ]
+    ] + rs.camera_exposure_args()
     # 【2026-10-18】AprilGrid 下预览窗一点用都没有（采图脚本只会找棋盘，永远不出绿点），
     # 但那个 Tk/PIL 预览每帧要 ~300 ms，开着只有 1.3 fps、10 秒只能存 13 张。
     # 所以非棋盘格时直接不开预览，帧数能翻好几倍。
@@ -96,7 +96,7 @@ def main():
 
     rc = subprocess.Popen(base).wait()
     images = sorted((CHECK_DIR / "cam0").glob("*.png"))
-    if rc != 0 and not images:
+    if rc != 0 and not images and checker:
         print()
         print("⚠️ 采集子进程起不来（多半是没有图形界面 / DISPLAY 不可用）。")
         print("   改成不带预览再跑一次，只做自动判读……")

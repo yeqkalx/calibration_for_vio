@@ -1,6 +1,7 @@
 # capture/ —— 外参标定的采集链路
 
-在 PyCharm 里打开 `camera_imu_calibration` 作为项目（解释器选
+
+在 PyCharm 里打开 `calibration_for_vio/extrinsic` 作为项目（解释器示例：
 `/home/kxy/miniforge3/envs/vins/bin/python`），然后：
 
 ```
@@ -11,7 +12,7 @@
    采数据之前点这个 → │ framing_check.py            │  ★ 10 秒取景/曝光体检，带预览窗
                       └─────────────────────────────┘
                       ┌─────────────────────────────┐
-   画面调对后点这个 → │ record_session.py           │  ★ 采一段数据，自动生成两份 CSV
+   画面调对后点这个 → │ record_session.py           │  ★ 采集 → 生成 CSV → 自动标定
                       └─────────────────────────────┘
                       ┌─────────────────────────────┐
    只想验证 IMU   →  │ imu_recorder.py             │  录 10 秒 IMU，给体检结论，不采图
@@ -21,7 +22,7 @@
                       └─────────────────────────────┘
 ```
 
-采集参数**全部**在 [`capture_config.py`](capture_config.py) 里，其它文件不用碰。
+采集参数在 [`capture_config.py`](capture_config.py)，标定板尺寸在对应的 YAML。
 
 > ⚠️ **为什么要有 `framing_check.py`**：采集时的预览窗被关掉了 —— 那个 Tk/PIL 预览每帧要
 > ~306 ms，开着它帧率只有 1.8 fps。代价是**采集变成盲拍**。2026-10-15 就因此白采了两轮
@@ -30,23 +31,19 @@
 
 ---
 
-## 一次完整的外参标定，要按顺序点 3 个文件
+## PyCharm 一键外参标定
 
-```
-① capture/record_session.py      ← 采集：图像 + IMU，同一个宿主机墙钟
-        ↓ 产出 data/sessionNN/{images.csv, imu.csv, cam0/*.png}
-② camera_imu_calibration/calibrate_extrinsics.py   ← 标定（项目根目录那个）
-        ↓ 产出 results/sessionNN/{report.json, camchain-kalibr.yaml, ...}
-③ results/sessionNN/extraction.json  ← 先看这个，判冒烟测试过不过
-```
+1. 在 `capture_config.py` 选 `TARGET_TYPE`：
+   - `"checkerboard"`：改 [`configs/checkerboard.yaml`](../configs/checkerboard.yaml) 的 `cols`、`rows`（横纵内角点数）和 `square_size`（实测格边长，米）。
+   - `"aprilgrid"`：改 [`configs/aprilgrid.yaml`](../configs/aprilgrid.yaml) 的 `tagCols`、`tagRows`、`tagSize`（单个 tag 黑框外沿边长，米）、`tagSpacing`（白隙 ÷ tagSize）。`first_id` 和 `tag_rotation_deg` 需与板子的 ID 排布和印版一致。
+2. 用一个新的 `SESSION_NAME`，保留 `CAPTURE_PURPOSE = "calibration"`、`RUN_CALIBRATION_AFTER = True`。两种板都运行同一个 `record_session.py`，不用修改 `extrinsics_config.py` 的 `PATHS`。
+3. 看到控制台提示「计时从现在开始」，让标定板保持可见，转动整套设备（绕三个轴，并做一些平移）。采集完成后不再占用设备，程序自动用本次图像、IMU 和对应的标定板 YAML 求解。先看 `results/<SESSION_NAME>/report.json`；通过后再用 `camchain-kalibr.yaml` 或 `camchain-openvins.yaml`。
 
-**②之前要先改一处**：`extrinsics_config.py` 最下面的 `PATHS`，把
-`images` / `imu` / `output` 指向 `record_session.py` 打印出来的那个会话目录。
-（`record_session.py` 跑完会把该复制的三行原样打印出来。改错了它会警告。）
+一次只用一种板。换板或重录时换一个 `SESSION_NAME`。如果只想录不求解，设 `RUN_CALIBRATION_AFTER = False`；`CAPTURE_PURPOSE = "vio"` 下也不会自动标定。
 
-> 为什么 `record_session.py` 不自动帮你改：那个文件是标定项目的核心配置，
-> 由另一个 AI 维护并带 `MANIFEST.sha256` 完整性校验。多一个写入方只会让校验失效、
-> 出问题时分不清是谁改的。所以它只**告诉你**该改什么，不改你的文件。
+默认采集 1920×1080 MJPG、请求 30 fps；可在 `capture_config.py` 的 `RESOLUTION` 切到 `720p` / `640x480`，分别对应 `configs/gemini_pro_rgb_720p.yaml` / `configs/gemini_pro_rgb_640x480.yaml`。切换分辨率必须同步换内参，工具会比对并报错，不会自动缩放。
+
+先对准板子并均匀补光，再开始采集。标定按当前内参的 `fx` 和 `CALIBRATION_AUTO_EXPOSE_EXPECTED_RATE_DPS`（默认 12°/s）计算曝光预算，灰度达到最低门槛但没到目标时仍会继续做曝光验证和标定板检测。`framing_check.py` 使用同一测光配置，可先跑它排查亮度和检出。
 
 ---
 
@@ -61,7 +58,7 @@
 ────────────────────────────────────────────────────────────
 起 IMU 录制线程 → 等 2 秒 → 拉起相机子进程 → 等它跑完 → 收 IMU → 写两份 CSV
 ────────────────────────────────────────────────────────────
-打印体检报告 + 下一步点哪个
+打印体检报告 → 标定模式下自动求解
 ```
 
 相机采完会在控制台看到它的实时输出（保存进度、实测帧率）。
@@ -144,8 +141,7 @@
 **改过 vendor 的代码要记在 `vendor/PROVENANCE.md` 里** —— 我已经记了。
 
 > ⚠️ `capture/` 靠"目录里已经有 PNG 就拒绝复用"来防止两轮数据混在一起
-> —— 这是 vendored 脚本自带的保护。所以**换轮次必须换 `SESSION_NAME`**，
-> 同时把 `extrinsics_config.py` 的 `PATHS` 跟着改（`record_session.py` 会把该复制的三行打印出来）。
+> —— 这是防止两轮数据混用的保护。**换轮次必须换 `SESSION_NAME`**，不必再改 `extrinsics_config.py` 的 `PATHS`。
 
 ### 关于帧率的经验值
 
@@ -173,7 +169,7 @@
 
 ```bash
 # 在 PyCharm 里直接点 selftest_capture.py 即可，等价于：
-/home/kxy/miniforge3/envs/vins/bin/python capture/selftest_capture.py
+python capture/selftest_capture.py
 ```
 
 它用**真实串口抓包**验证 MAVLink 解码、用**伪终端造一个假飞控**走完
