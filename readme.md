@@ -1,0 +1,2 @@
+pure-uav 项目vio部分代码
+包含外参标定 camera内参标定 imu噪声以及imu加速度
