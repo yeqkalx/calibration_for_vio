@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 """Board-based monocular camera–IMU extrinsic/time calibration; no ROS runtime."""
 import argparse
-import json
-import sys
 from dataclasses import asdict, fields
+import json
 from pathlib import Path
+import sys
 
+from calib.acquisition import acquisition_preflight
 from calib.data import CalibrationError, Camera, Target, load_dataset, read_yaml
 from calib.solver import Problem, save_result
-from calib.acquisition import acquisition_preflight
 from calib.windows import describe_problem, diagnostics_from_extraction, visual_diagnostics
 from extrinsics_config import (CAM_TOPIC, IMAGE_TIMESTAMP_UNIT, IMU_TIMESTAMP_UNIT,
-                               IMU_TOPIC, PATHS, SETTINGS, Settings)
+                               IMU_TOPIC, PATHS, ROOT, SETTINGS, Settings)
+
+
+def find_sessions(data_dir=None):
+    """列出 data/ 下同时包含 images.csv 与 imu.csv 的会话名（按修改时间从新到旧）。"""
+    data = Path(data_dir) if data_dir else (ROOT / "data")
+    if not data.is_dir():
+        return []
+    rows = [(p.stat().st_mtime, p.name) for p in data.iterdir()
+            if p.is_dir() and (p / "images.csv").is_file() and (p / "imu.csv").is_file()]
+    return [name for _, name in sorted(rows, reverse=True)]
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--session", help="快捷指定 data/<session>（传 latest 自动取最新会话）")
+    p.add_argument("--list", action="store_true", help="列出 data/ 下所有可用会话后退出")
     p.add_argument("--camera", type=Path, default=PATHS["camera"])
     p.add_argument("--camera-name", default="cam0")
     p.add_argument("--target", type=Path, default=PATHS["target"])
@@ -43,6 +55,25 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.list:
+        sessions = find_sessions()
+        print("可用的 session（从新到旧）：" if sessions else f"在 {ROOT / 'data'} 下未找到可用 session")
+        for name in sessions:
+            print(f"  {name}")
+        return 0
+    if args.session:
+        name = args.session
+        if name == "latest":
+            sessions = find_sessions()
+            if not sessions:
+                print(f"失败：{ROOT / 'data'} 下没有找到可用 session。", file=sys.stderr)
+                return 2
+            name = sessions[0]
+        args.images = ROOT / "data" / name / "images.csv"
+        args.imu = ROOT / "data" / name / "imu.csv"
+        if args.output == PATHS["output"]:
+            args.output = ROOT / "results" / name
+
     # Never reuse a result directory: an unsuccessful run must not leave stale
     # calibration YAMLs that could be mistaken for a new successful result.
     if args.output.exists() and any(args.output.iterdir()):
@@ -59,7 +90,7 @@ def main(argv=None):
             update = read_yaml(args.settings)
             if not isinstance(update, dict):
                 raise CalibrationError("Settings YAML 顶层必须为配置项映射。")
-            unknown = set(update)-{f.name for f in fields(Settings)}
+            unknown = set(update) - {f.name for f in fields(Settings)}
             if unknown:
                 raise CalibrationError(f"未知配置项 {sorted(unknown)}")
             params.update(update)
@@ -84,11 +115,11 @@ def main(argv=None):
         observations, tc, ti, imu, epoch = load_dataset(
             camera, target, settings, args.output, images=args.images, imu=args.imu, bag=args.bag,
             image_unit=args.image_unit, imu_unit=args.imu_unit, cam_topic=args.cam_topic, imu_topic=args.imu_topic)
-        extraction = json.loads((args.output/"extraction.json").read_text(encoding="utf-8"))
+        extraction = json.loads((args.output / "extraction.json").read_text(encoding="utf-8"))
         diagnostics = visual_diagnostics(tc, extraction, max_gap_s=settings.max_camera_gap_s,
                                          min_frames=settings.min_frames,
                                          min_duration_s=settings.min_duration_s)
-        print(f"有效图像 {len(observations)}，检测时间跨度 {tc[-1]-tc[0]:.3f}s", flush=True)
+        print(f"有效图像 {len(observations)}，检测时间跨度 {tc[-1] - tc[0]:.3f}s", flush=True)
         advice = describe_problem(diagnostics, settings)
         for line in advice:
             print(f"检出诊断：{line}", file=sys.stderr, flush=True)
@@ -103,15 +134,15 @@ def main(argv=None):
                     f"≥{settings.min_frames} 帧、相邻有效帧间隔 ≤{settings.max_camera_gap_s:g}s"
                     "（原因见上面的检出诊断，或报告里的 visual_diagnostics）。")
             starts, stops = best["start_index"], best["stop_index"]
-            if starts > 0 or stops < len(observations)-1:
+            if starts > 0 or stops < len(observations) - 1:
                 window = {"auto_selected": True, "start_s": best["start_s"], "stop_s": best["stop_s"],
                           "duration_s": best["duration_s"], "frames": best["frames"],
-                          "dropped_frames": len(observations)-best["frames"],
+                          "dropped_frames": len(observations) - best["frames"],
                           "reason": "检出空洞超过 max_camera_gap_s，只拟合最长连续段"}
                 print(f"自动选窗：{best['start_s']:.3f}s→{best['stop_s']:.3f}s"
                       f"（{best['duration_s']:.2f}s，{best['frames']} 帧），丢弃 {window['dropped_frames']} 帧；"
                       f"整段有 {len(diagnostics['gaps_over_limit_s'])} 处超限空洞。", flush=True)
-                observations, tc = observations[starts:stops+1], tc[starts:stops+1]
+                observations, tc = observations[starts:stops + 1], tc[starts:stops + 1]
             else:
                 window = {"auto_selected": False, "start_s": best["start_s"], "stop_s": best["stop_s"],
                           "duration_s": best["duration_s"], "frames": best["frames"],
@@ -136,11 +167,9 @@ def main(argv=None):
         return 0
     except (CalibrationError, ValueError, KeyError, OSError, TypeError) as exc:
         report_path = args.output / "report.json"
-        # 中途失败也要给证据：从 extraction.json 重建"哪些帧被接受、空洞在哪、
-        # 是不是糊了"。否则用户只能看到一句结论，不知道下一步该改什么。
         if diagnostics is None and settings is not None:
             try:
-                extraction = json.loads((args.output/"extraction.json").read_text(encoding="utf-8"))
+                extraction = json.loads((args.output / "extraction.json").read_text(encoding="utf-8"))
                 diagnostics = diagnostics_from_extraction(
                     extraction, max_gap_s=settings.max_camera_gap_s,
                     min_frames=settings.min_frames, min_duration_s=settings.min_duration_s)
@@ -156,7 +185,6 @@ def main(argv=None):
             report_path.write_text(json.dumps(stub, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"标定失败：{exc}\n诊断：{report_path}", file=sys.stderr)
         return 2
-
 
 
 if __name__ == "__main__":

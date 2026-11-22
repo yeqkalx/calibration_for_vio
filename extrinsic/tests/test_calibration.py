@@ -99,7 +99,10 @@ class CalibrationTests(unittest.TestCase):
             image = np.full((500, 500), 255, np.uint8)
             for row in range(3):
                 for col in range(3):
-                    tag = cv2.aruco.generateImageMarker(tgt.dictionary, (2-row)*3+col, 100)
+                    tag_id = (2-row)*3+col
+                    tag = (cv2.aruco.generateImageMarker(tgt.dictionary, tag_id, 100)
+                           if hasattr(cv2.aruco, "generateImageMarker")
+                           else cv2.aruco.drawMarker(tgt.dictionary, tag_id, 100))
                     if rotated:
                         tag = np.rot90(tag, 2)
                     image[50+150*row:150+150*row, 50+150*col:150+150*col] = tag
@@ -153,7 +156,7 @@ class CalibrationTests(unittest.TestCase):
         import json
         from calib.data import read_yaml
         from calib.solver import save_result, opencv_yaml
-        from prepare_openvins import prepare
+        from tools.prepare_openvins import prepare
         c = Camera({"camera_model": "pinhole", "distortion_model": "radtan",
                     "intrinsics": [700., 710., 400., 300.], "distortion_coeffs": [0., 0., 0., 0.],
                     "resolution": [800, 600]})
@@ -196,7 +199,7 @@ class CalibrationTests(unittest.TestCase):
             self.assertFalse((root/"five/camchain-openvins.yaml").exists())
 
     def test_clock_affine_fit_and_failure(self):
-        from remap_imu_clock import fit_clock
+        from tools.remap_imu_clock import fit_clock
         imu = np.arange(0, 11000000000, 1000000000, dtype=np.int64)+123456789
         host = np.rint(1.00004*(imu-imu[0])).astype(np.int64)+1700000000123456789
         scale, offset, _, _, residual = fit_clock(imu, host)

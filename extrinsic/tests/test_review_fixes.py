@@ -15,7 +15,7 @@ from calib.data import CalibrationError, Camera, Observation, read_yaml
 from calib.solver import Problem, save_result, opencv_yaml
 from calib.spline import PoseSpline
 from extrinsics_config import Settings
-from prepare_openvins import prepare
+from tools.prepare_openvins import prepare
 
 ROOT = Path(__file__).resolve().parents[1]
 

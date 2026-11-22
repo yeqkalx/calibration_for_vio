@@ -1,49 +1,141 @@
 """MAVLink 飞控 IMU → imu.csv（外参标定用）
 
-不依赖 pyserial：用内核自带的 termios + os.read，和你 `imu/src` 里那几个脚本一致。
-MAVLink 编解码用 `vendor/mavlink_min.py`（已在真实串口抓包上验证：98 帧、0 CRC 错）。
+不依赖 pyserial：用内核自带的 termios + os.read。
+MAVLink 编解码使用同目录 `mavlink_min.py`。
 
-时间戳策略 —— 这一段决定标定能不能做，别改：
+时间戳策略：
   相机侧记的是宿主机 CLOCK_REALTIME（`time.time_ns()`）。这里必须记同一个钟。
-  若直接改用飞控的 `time_usec`（开机微秒），两路时间轴差了"开机时长 + 1970 年"这么大
-  的量级，标定程序 ±0.1 s 的搜索窗根本够不着，会直接报"时间重叠不足"。
-
-  但串口是批量读的：一次 read 可能拿到好几帧。若给同批帧打同一个时间戳，
-  200 Hz 下批内就有 5~15 ms 的人为抖动 —— 而标定要估的时移精度是 1 ms 量级。
-  所以分两层：
-    1) 批内：用飞控自己的 `time_usec` 算相对间隔，抖动压到亚毫秒级；
-    2) 全段：录完后用 (宿主收到时间 − time_usec) 的**下包络**拟合一条直线，
-       把每批 read 的锚点换成"全段统一映射"（`imu_timebase.py`）。
-       这样"这一批在 OS 缓冲里躺了多久"不再进入时间戳 —— 2026-10-18 实测，
-       旧方案下同一台设备的相机-IMU 时移在 −27…+9 ms 之间跳，变的就是这个积压。
-  剩下的固定传输延迟（线缆 + 飞控输出）是常数，会被标定的 offset 搜索吸收；
-  下包络拟合只保证它**跨录制稳定**，并且把积压量写进统计（`timebase`）。
+  1) 批内：用飞控自己的 `time_usec` 算相对间隔，抖动压到亚毫秒级；
+  2) 全段：录完后用 (宿主收到时间 − time_usec) 的下包络做 Theil-Sen 直线拟合，
+     把每批 read 的锚点换成全段统一映射（`fit_timebase` / `anchor_timestamps`），
+     使读线程积压不再进入时间戳。
 """
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass, field
+from itertools import combinations
 import json
 import math
 import os
+from pathlib import Path
 import select
 import sys
 import termios
 import threading
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
-from mavlink_min import MavlinkParser, pack  # noqa: E402
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import imu_timebase  # noqa: E402  同目录，纯运算模块
+from capture.mavlink_min import MavlinkParser, pack  # noqa: E402
 
 MAV_CMD_SET_MESSAGE_INTERVAL = 511
 MSG_HIGHRES_IMU = 105
-# HIGHRES_IMU.fields_updated 里代表 IMU 六个量的位：xacc..zgyro
 IMU_FIELD_BITS = 0x3F
 CSV_HEADER = ["timestamp", "ax", "ay", "az", "gx", "gy", "gz"]
+
+# 下包络拟合常数
+_FLOOR_QUANTILE = 0.001
+_MAX_DRIFT_PPM = 500.0
+_MAX_SHIFT_NS = 5_000_000_000
+
+
+# --------------------------------------------------------------------------
+# 飞控 time_usec -> 宿主 REALTIME 下包络时间基准拟合
+# --------------------------------------------------------------------------
+
+def _median(values):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return float(s[n // 2]) if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _quantile(sorted_values, q):
+    if not sorted_values:
+        return 0.0
+    k = int(round(q * (len(sorted_values) - 1)))
+    return sorted_values[min(len(sorted_values) - 1, max(0, k))]
+
+
+def fit_timebase(fc_usec, host_ns, *, min_samples=50, max_bins=64):
+    """对 (飞控时间, 宿主收到时间) 做下包络直线拟合。"""
+    pairs = [(int(f), int(h)) for f, h in zip(fc_usec, host_ns) if f > 0 and h > 0]
+    if len(pairs) < min_samples:
+        return {"ok": False, "reason": f"有飞控时间的样本只有 {len(pairs)} 个"}
+    f0 = pairs[0][0]
+    last = None
+    for f, _h in pairs:
+        if last is not None and f <= last:
+            return {"ok": False, "reason": "飞控 time_usec 不严格递增（重启/回绕？）"}
+        last = f
+    span_ns = (pairs[-1][0] - f0) * 1000
+    if span_ns < 1_000_000_000:
+        return {"ok": False, "reason": f"跨度只有 {span_ns / 1e9:.2f} s，不足以拟合"}
+    offsets = [h - f * 1000 for f, h in pairs]
+    k = max(4, min(max_bins, len(pairs) // 50))
+    binned = []
+    for i in range(k):
+        a, b = i * len(pairs) // k, (i + 1) * len(pairs) // k
+        if b <= a:
+            continue
+        j = min(range(a, b), key=offsets.__getitem__)
+        binned.append(((pairs[j][0] - f0) * 1000, offsets[j]))
+    if len(binned) < 4:
+        return {"ok": False, "reason": "下包络样本不足"}
+    slopes = [(y2 - y1) / (x2 - x1) for (x1, y1), (x2, y2) in combinations(binned, 2) if x2 > x1]
+    drift = _median(slopes) if slopes else 0.0
+    drift_ppm = drift * 1e6
+    if abs(drift_ppm) > _MAX_DRIFT_PPM:
+        return {"ok": False, "reason": f"飞控/宿主时钟频率差 {drift_ppm:.0f} ppm 异常"}
+    corrected = sorted((h - f * 1000) - drift * (f - f0) * 1000 for f, h in pairs)
+    floor_ns = _quantile(corrected, _FLOOR_QUANTILE)
+    delays = sorted(d - floor_ns for d in corrected)
+    return {
+        "ok": True, "reason": "",
+        "offset_ns": floor_ns, "drift": drift, "f0_usec": f0,
+        "drift_ppm": drift_ppm, "span_s": span_ns / 1e9, "bins": len(binned),
+        "delay_median_ms": _quantile(delays, 0.5) / 1e6,
+        "delay_p95_ms": _quantile(delays, 0.95) / 1e6,
+    }
+
+
+def anchor_timestamps(fc_usec, host_ns, provisional_ns, *, min_samples=50):
+    """把样本时间戳改成"飞控时间 + 下包络映射"。"""
+    provisional = [int(t) for t in provisional_ns]
+    fit = fit_timebase(fc_usec, host_ns, min_samples=min_samples)
+    if not fit["ok"]:
+        return provisional, {"ok": False, "reason": fit["reason"],
+                             "fallback_samples": len(provisional), "shift_median_ms": None}
+    offset, drift, f0 = fit["offset_ns"], fit["drift"], fit["f0_usec"]
+    out, last, clamped, fallback = [], None, 0, 0
+    for f, prov in zip(fc_usec, provisional):
+        f = int(f)
+        if f > 0:
+            x = (f - f0) * 1000
+            t = int(round(f * 1000 + offset + drift * x))
+        else:
+            t = prov
+            fallback += 1
+        if last is not None and t <= last:
+            t = last + 1
+            clamped += 1
+        last = t
+        out.append(t)
+    shifts = sorted(p - t for p, t in zip(provisional, out))
+    info = {**fit,
+            "shift_median_ms": _quantile(shifts, 0.5) / 1e6,
+            "shift_p95_ms": _quantile(shifts, 0.95) / 1e6,
+            "shift_max_ms": shifts[-1] / 1e6,
+            "clamped": clamped, "fallback_samples": fallback}
+    if max(abs(s) for s in shifts) > _MAX_SHIFT_NS:
+        return provisional, {"ok": False, "reason": "锚定前后时间戳差超过 5 s，疑似拟合异常",
+                             "fallback_samples": len(provisional), "shift_median_ms": None}
+    return out, info
 
 
 # --------------------------------------------------------------------------
@@ -62,10 +154,10 @@ def open_serial(path, baud=115200):
     fd = os.open(str(path), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     try:
         a = termios.tcgetattr(fd)
-        a[0] = 0            # iflag：关掉所有输入处理
-        a[1] = 0            # oflag
+        a[0] = 0
+        a[1] = 0
         a[2] = termios.CLOCAL | termios.CREAD | termios.CS8
-        a[3] = 0            # lflag：原始模式
+        a[3] = 0
         a[4] = a[5] = _baud_constant(baud)
         termios.tcsetattr(fd, termios.TCSANOW, a)
         termios.tcflush(fd, termios.TCIOFLUSH)
@@ -84,11 +176,7 @@ def list_serial_candidates():
 
 
 def find_mavlink_port(candidates=None, timeout=1.5, baud=115200, log=print):
-    """在候选串口里逐个监听，返回第一个真的在讲 MAVLink 的口。
-
-    只看不发：不发任何请求，纯粹听 1.5 秒。所以对飞控没有任何副作用。
-    7-Nano 的两个 ACM 口里，通常只有一个在跑 MAVLink。
-    """
+    """在候选串口里逐个监听，返回第一个真的在讲 MAVLink 的口。"""
     candidates = list(candidates) if candidates else list_serial_candidates()
     if not candidates:
         return None, {}
@@ -139,8 +227,6 @@ class _Sample:
     gx: float
     gy: float
     gz: float
-    # 原始证据：飞控 time_usec（µs）和这一批 read 的宿主时间（ns）。
-    # timestamp_ns 先按"本批 read"打，录完后再用全段下包络重算（见 imu_timebase）。
     fc_usec: int = 0
     host_ns: int = 0
 
@@ -166,7 +252,6 @@ class ImuRecorder:
     _anchored: bool = field(default=False, init=False, repr=False)
     startup_discard_s: float = field(default=0.0, kw_only=True)
 
-    # ---- 生命周期 ----
     def start(self, wait_first_s=3.0):
         self._fd = open_serial(self.port, self.baud)
         self._thread = threading.Thread(target=self._loop, name="imu-recorder", daemon=True)
@@ -201,7 +286,7 @@ class ImuRecorder:
         if not self.samples:
             self._timebase = {"ok": False, "reason": "没有样本"}
             return self._timebase
-        stamps, info = imu_timebase.anchor_timestamps(
+        stamps, info = anchor_timestamps(
             [s.fc_usec for s in self.samples],
             [s.host_ns for s in self.samples],
             [s.timestamp_ns for s in self.samples])
@@ -210,7 +295,6 @@ class ImuRecorder:
         self._timebase = info
         return info
 
-    # ---- 线程体 ----
     def _loop(self):
         parser = MavlinkParser()
         target = None
@@ -292,18 +376,16 @@ class ImuRecorder:
                     continue
                 n_frames += len(hi)
 
-                # 批次内插值：以本批最后一帧为锚，用飞控 time_usec 反推每帧的宿主时间
                 anchor_usec = int(hi[-1].fields.get("time_usec", 0) or 0)
                 for frame in hi:
                     f = frame.fields
                     try:
                         t_usec = int(f.get("time_usec", 0) or 0)
                         if t_usec and last_time_usec is not None and t_usec == last_time_usec:
-                            n_dup += 1          # 飞控发得比传感器快：同一样本重复
+                            n_dup += 1
                             continue
                         if t_usec:
                             last_time_usec = t_usec
-                        # 注意括号：`&` 的优先级低于 `==`，写错就恒为假
                         if (int(f.get("fields_updated", 0) or 0) & IMU_FIELD_BITS) == 0:
                             n_fields_updated_zero += 1
                         if t_usec and anchor_usec and anchor_usec >= t_usec:
@@ -311,17 +393,6 @@ class ImuRecorder:
                             n_interpolated += 1
                         else:
                             ts = t_host
-                        # 强制严格递增。串口是批量读的：飞控被 SET_MESSAGE_INTERVAL 唤醒时
-                        # 会先把请求之前积压的历史样本一次性倒出来，读线程连续两次 read 的
-                        # 宿主时间只差一两毫秒，而每块的 time_usec 跨度有几百毫秒 ——
-                        # 插出来的时间戳就会退到上一批最后一帧之前。
-                        # 标定程序要求严格递增，会直接拒绝整份数据。
-                        # （2026-10-15 实际踩到过：2744 个样本里 8 个倒退 4.7~9.3 ms。）
-                        #
-                        # 代价要说清楚：被兜住的样本会被压到上一帧之后 1 ns，批内相对间隔
-                        # 失真。对"开头一小段积压"这种真实情况无所谓（那段本来就会被标定
-                        # 程序按 max_offset_s 的边距丢掉）；但如果占比很高，说明串口读得断续，
-                        # 那时该修的是链路，不是继续兜 —— verdict() 会对高占比报警。
                         if last_ts is not None and ts <= last_ts:
                             ts = last_ts + 1
                             n_clamped += 1
@@ -348,7 +419,6 @@ class ImuRecorder:
                 rate_request_ack=ack_result,
                 target=target)
 
-    # ---- 统计 ----
     def _finish_stats(self):
         extra = getattr(self, "_finish_extra", {}) or {}
         ts = [s.timestamp_ns for s in self.samples]
@@ -356,9 +426,6 @@ class ImuRecorder:
         gaps_sorted = sorted(gaps_ms)
         span = (ts[-1] - ts[0]) / 1e9 if len(ts) > 1 else 0.0
         instances = extra.get("instances", [])
-        # 录制期间到底转了多少 —— 由陀螺仪客观回答，不靠手感。
-        # 标定要求 min_rotation_std_rad_s=0.05 rad/s ≈ 2.9°/s 的多轴激励；
-        # 而运动模糊的门槛在几十 °/s 的量级。中位数落在这两者之间才算"转得合适"。
         if self.samples:
             mags = sorted(math.degrees(math.sqrt(s.gx ** 2 + s.gy ** 2 + s.gz ** 2))
                           for s in self.samples)
@@ -405,7 +472,6 @@ class ImuRecorder:
         self.stats = stats
         return stats
 
-    # ---- 输出 ----
     def write_csv(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -414,8 +480,6 @@ class ImuRecorder:
             writer.writerow(CSV_HEADER)
             for s in self.samples:
                 writer.writerow([s.timestamp_ns, s.ax, s.ay, s.az, s.gx, s.gy, s.gz])
-        # 时间基准的取证记录：这一份 imu.csv 的时间戳到底怎么来的、读线程积压多大。
-        # 标定侧只读 imu.csv，这个文件是给人排查"跨录制时移漂"用的。
         if self._timebase:
             info = dict(self._timebase)
             info["csv"] = str(path)
@@ -427,9 +491,7 @@ class ImuRecorder:
                 json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
         return path
 
-    # ---- 体检结论 ----
     def verdict(self):
-        """把统计翻译成"这份数据能不能拿去标定"。"""
         return verdict(self.stats or self._finish_stats())
 
 
@@ -439,14 +501,13 @@ def verdict(s):
         return "fail", f"串口出错：{s['error']}"
     if s["samples"] < 100:
         return "fail", f"只收到 {s['samples']} 个样本，太少了 —— 飞控没在发 HIGHRES_IMU？"
-    # 结构性缺陷优先报（它们是硬伤，转动量是运动建议）
     if s["mixed_instances"]:
         return "fail", (f"记录中途 IMU 实例变了 {s['instances']} —— 标定程序会拒绝，"
                         "请固定同一个实例后再采")
     clamped = s.get("timestamps_clamped", 0)
     if clamped > max(10, 0.01 * s["samples"]):
         return "warn", (f"有 {clamped}/{s['samples']} 个样本的时间戳因乱序被强制递增"
-                        f"（占 {100*clamped/s['samples']:.1f}%）。"
+                        f"（占 {100 * clamped / s['samples']:.1f}%）。"
                         "集中在开头是正常的积压突发；占比高说明串口读得断续，"
                         "换 USB 口/线，或把 IMU_REQUEST_HZ 降下来")
     if s.get("timestamp_anchor") == "read_time":
@@ -466,16 +527,13 @@ def verdict(s):
         return "warn", (f"实测 {s['observed_hz']:.1f} Hz，有 {s['gaps_over_50ms']} 处 >50 ms 空洞。"
                         "必须用 configs/probe.yaml（max_imu_gap_s=0.15），"
                         "否则默认的 0.05 会让标定直接拒绝")
-    # 转动量：这是"你到底动了没有"的客观答案，不靠手感。
-    # 标定要 min_rotation_std_rad_s=0.05 rad/s ≈ 2.9°/s 的多轴激励；
-    # 运动模糊的门槛在几十 °/s 量级 —— 中位数落在两者之间才算"转得合适"。
     med = s.get("gyro_med_deg_s", 0.0)
     if med < 2.0:
         return "fail", (f"录制期间陀螺中位只有 {med:.1f}°/s —— 你基本上没动。"
                         "标定需要多轴转动（门槛是约 2.9°/s 的标准差），"
                         "静静举着是估不出外参的")
     if med > 60.0:
-        return "warn", (f"录制期间陀螺中位 {med:.1f}°/s、P95 {s.get('gyro_p95_deg_s',0):.0f}°/s "
+        return "warn", (f"录制期间陀螺中位 {med:.1f}°/s、P95 {s.get('gyro_p95_deg_s', 0):.0f}°/s "
                         "—— 转得偏快，容易运动模糊。建议压低到 10~20°/s")
     if s.get("gyro_p95_deg_s", 0) > 120.0:
         return "warn", (f"陀螺峰值 P95 = {s['gyro_p95_deg_s']:.0f}°/s —— 有猛甩动作，"
@@ -511,21 +569,16 @@ def format_stats(stats) -> str:
         f"（>50ms: {stats['gaps_over_50ms']}, >150ms: {stats['gaps_over_150ms']}）\n"
         f"  IMU 实例        {stats['instances']}"
         f"{'  ⚠️ 混用了多个实例' if stats['mixed_instances'] else ''}\n"
-        f"  转动量 |ω|      中位 {stats.get('gyro_med_deg_s',0):.1f} °/s"
-        f"，P95 {stats.get('gyro_p95_deg_s',0):.0f} °/s"
-        f"，各轴标准差 {stats.get('gyro_axis_std_deg_s',0):.1f} °/s  ← 你到底动了没有\n"
+        f"  转动量 |ω|      中位 {stats.get('gyro_med_deg_s', 0):.1f} °/s"
+        f"，P95 {stats.get('gyro_p95_deg_s', 0):.0f} °/s"
+        f"，各轴标准差 {stats.get('gyro_axis_std_deg_s', 0):.1f} °/s  ← 你到底动了没有\n"
         f"  fields_updated  全零的帧 {stats['fields_updated_zero']}\n"
         f"  MAVLink         {stats['parser']}"
     )
 
 
-# --------------------------------------------------------------------------
-# 单独运行 = IMU 体检（不采图，只验证飞控这条链路）
-# --------------------------------------------------------------------------
 def _main():
-    here = Path(__file__).resolve().parent
-    sys.path.insert(0, str(here))
-    import capture_config as cfg
+    import extrinsics_config as cfg
 
     seconds = float(getattr(cfg, "IMU_CHECK_SECONDS", 10.0))
     print("=" * 74)
@@ -540,7 +593,7 @@ def _main():
             for k, v in report.items():
                 print(f"     {k}: {v}")
             print("\n  检查：飞控通电了吗？USB 线是数据线不是充电线吗？"
-                  "换一个 ttyACM 试试（在 capture_config.py 里写死 IMU_PORT）。")
+                  "换一个 ttyACM 试试（在 extrinsics_config.py 里写死 IMU_PORT）。")
             return 2
     rec = ImuRecorder(port, request_hz=cfg.IMU_REQUEST_HZ, baud=cfg.IMU_BAUD,
                       startup_discard_s=cfg.IMU_STARTUP_DISCARD_S)
@@ -558,7 +611,7 @@ def _main():
     icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}[level]
     print(f"\n{icon} 结论：{text}")
     if level != "fail":
-        out = rec.write_csv(here / "imu_check.csv")
+        out = rec.write_csv(HERE / "imu_check.csv")
         print(f"样本已写出：{out}")
     return 0 if level != "fail" else 2
 

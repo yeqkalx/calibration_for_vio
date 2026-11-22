@@ -7,30 +7,107 @@
   4) capture_manifest.json → images.csv
   5) 打印采集体检；标定模式下自动用两份 CSV 求解外参
 
-相机那半段用的是 vendor/capture_calibration.py（原样复制的、已经跑过好几轮内参的脚本），
-不重写、不魔改。所有可调参数都在 capture_config.py。
+所有可调参数都在 extrinsics_config.py。
 """
 from __future__ import annotations
 
+import csv
 import json
+from pathlib import Path
 import shlex
 import subprocess
 import sys
+from types import SimpleNamespace
 import time
-from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-import capture_config as cfg                       # noqa: E402
-import image_health                                # noqa: E402
-import imu_recorder                                # noqa: E402
-import make_images_csv                              # noqa: E402
+import extrinsics_config as cfg                    # noqa: E402
+from capture import image_health                   # noqa: E402
+from capture import imu_recorder                   # noqa: E402
 
-VENDOR = HERE / "vendor"
-CAMERA_SCRIPT = VENDOR / "capture_calibration.py"
+CAMERA_SCRIPT = HERE / "capture_calibration.py"
+
+
+# --------------------------------------------------------------------------
+# capture_manifest.json -> images.csv
+# --------------------------------------------------------------------------
+
+class ManifestError(RuntimeError):
+    pass
+
+
+def load_manifest(session_dir):
+    path = Path(session_dir) / "capture_manifest.json"
+    if not path.is_file():
+        raise ManifestError(
+            f"没找到 {path}。相机那一步没跑成功？"
+            "（这个文件由 capture/capture_calibration.py 在采集结束时写出）")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    saved = data.get("saved") or []
+    if not saved:
+        raise ManifestError(f"{path} 里一张图都没有 —— 采集是不是一开始就被中断了？")
+    return data, saved
+
+
+def build_images_csv(session_dir, out_name="images.csv", log=print):
+    """写出 images.csv，返回统计 dict。"""
+    session_dir = Path(session_dir)
+    data, saved = load_manifest(session_dir)
+
+    rows, missing = [], []
+    for entry in saved:
+        stamp = int(entry["host_receive_time_ns"])
+        name = entry["file"]
+        if not (session_dir / name).is_file():
+            missing.append(name)
+        rows.append((stamp, name))
+
+    if missing:
+        raise ManifestError(
+            f"manifest 里列了 {len(missing)} 张图，但磁盘上不存在，例如 {missing[:3]}。"
+            "别继续 —— 这种数据标出来的外参没有意义。")
+
+    stamps = [s for s, _ in rows]
+    if any(b <= a for a, b in zip(stamps, stamps[1:])):
+        raise ManifestError("图像时间戳不是严格递增的 —— manifest 被改过，或者文件名时间戳重复。")
+
+    out = session_dir / out_name
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["timestamp", "filename"])
+        writer.writerows(rows)
+
+    gaps_ms = [(b - a) / 1e6 for a, b in zip(stamps, stamps[1:])]
+    gaps_sorted = sorted(gaps_ms)
+    span = (stamps[-1] - stamps[0]) / 1e9
+    stats = {
+        "images": len(rows),
+        "span_s": span,
+        "observed_fps": (len(rows) - 1) / span if span > 0 else 0.0,
+        "median_gap_ms": gaps_sorted[len(gaps_sorted) // 2] if gaps_sorted else 0.0,
+        "max_gap_ms": max(gaps_ms) if gaps_ms else 0.0,
+        "gaps_over_100ms": sum(1 for g in gaps_ms if g > 100.0),
+        "gaps_over_350ms": sum(1 for g in gaps_ms if g > 350.0),
+        "board_detected": sum(1 for e in saved if e.get("board_detected")),
+        "csv": str(out),
+        "manifest_mode": (data.get("mode") or {}).get("width", "?"),
+        "manifest_resolution": "%sx%s" % ((data.get("mode") or {}).get("width", "?"),
+                                          (data.get("mode") or {}).get("height", "?")),
+        "manifest_termination": data.get("termination"),
+    }
+    log(f"写出 {out} —— {stats['images']} 张，跨度 {span:.2f}s，实测 {stats['observed_fps']:.1f} fps")
+    return stats
+
+
+make_images_csv = SimpleNamespace(
+    ManifestError=ManifestError,
+    load_manifest=load_manifest,
+    build=build_images_csv,
+)
 
 
 def auto_calibration_enabled():
@@ -73,17 +150,11 @@ def scan_cameras(expected="2bc5:0511"):
 
 
 def usb_devices(ids="2bc5:0511"):
-    """按 USB 身份在 sysfs 里找设备（不看 /dev/video*）。
-
-    用来区分两种完全不同的故障：
-      - 设备在总线上、只是没有 /dev/video 节点  → uvcvideo 没绑上（被 libuvc 抢走后没还）
-      - 设备根本不在总线上                      → 线没插好 / 口不供电
-    返回 sysfs 子目录名，例如 ['3-6.1']。
-    """
+    """按 USB 身份在 sysfs 里找设备（不看 /dev/video*）。"""
     vendor, product = ids.lower().split(":")
     hits = []
     for d in sorted(Path("/sys/bus/usb/devices").glob("*")):
-        if ":" in d.name:          # 接口项（3-6.1:1.0）也带 idVendor，跳过
+        if ":" in d.name:
             continue
         try:
             v = (d / "idVendor").read_text().strip().lower()
@@ -103,15 +174,15 @@ def read_target(path):
     if kind in ("checkerboard", "chessboard"):
         cols, rows = int(entry.get("cols", 0)), int(entry.get("rows", 0))
         size = float(entry.get("square_size", 0))
-        span = ((cols - 1) * size, (rows - 1) * size)     # 最外圈内角点之间的跨度
+        span = ((cols - 1) * size, (rows - 1) * size)
         label = (f"棋盘 {cols}x{rows} 内角点，格边 {size * 100:g} cm，"
                  f"角点跨度 {span[0] * 100:.1f}x{span[1] * 100:.1f} cm")
     else:
         cols, rows = int(entry.get("tagCols", 0)), int(entry.get("tagRows", 0))
         size = float(entry.get("tagSize", 0))
         spacing = float(entry.get("tagSpacing", 0.0))
-        pitch = size * (1 + spacing)                      # 相邻 tag 的中心距
-        span = ((cols - 1) * pitch + size, (rows - 1) * pitch + size)   # 整板外沿
+        pitch = size * (1 + spacing)
+        span = ((cols - 1) * pitch + size, (rows - 1) * pitch + size)
         label = (f"AprilGrid {cols}x{rows} tag，tagSize {size * 100:g} cm，"
                  f"整板 {span[0] * 100:.1f}x{span[1] * 100:.1f} cm")
     return {"kind": kind, "cols": cols, "rows": rows, "size": size,
@@ -144,19 +215,14 @@ def preflight():
             node = on_bus[0]
             print()
             print(f"  ⚠️  但它在 USB 总线上是在的：{', '.join(on_bus)}")
-            print("     => 设备没掉线，是内核没给它建 /dev/video 节点。")
-            print("     最常见原因：刚跑过 vio_online 或 orbbec_probe —— 它们用 libuvc")
-            print("     直接抢走了这颗相机的 UVC 接口，退出时 uvcvideo 没能重新绑回去。")
-            print()
+            print("     => 设备没掉线，是内核没给它建 /dev/video 节点（uvcvideo 未绑定）。")
             print("     恢复（任选一个，a 最稳）：")
             print("       a) 把相机的 USB 线拔掉、等 3 秒、插回去")
             print(f"       b) sudo sh -c 'echo 0 > /sys/bus/usb/devices/{node}/authorized;"
                   f" sleep 1; echo 1 > /sys/bus/usb/devices/{node}/authorized'")
             print("       c) sudo modprobe -r uvcvideo && sudo modprobe uvcvideo")
-            print("     恢复后 v4l2-ctl --list-devices 里应该重新出现 2bc5:0511。")
             raise RuntimeError("相机在总线上但没有 /dev/video 节点（uvcvideo 没绑定回去）。")
-        raise RuntimeError("相机没插或没被识别：USB 数据线插好了吗？"
-                           "（笔记本内置摄像头是 04f2:b829，不是它）")
+        raise RuntimeError("相机没插或没被识别：USB 数据线插好了吗？")
     device, name = cameras[0]
     print(f"  ✅ {device}  ({name})")
 
@@ -168,7 +234,7 @@ def preflight():
             for k, v in report.items():
                 print(f"     {k}: {v}")
             raise RuntimeError("没找到在讲 MAVLink 的串口：飞控通电了吗？USB 线是数据线吗？"
-                               "或在 capture_config.py 里把 IMU_PORT 写死成 /dev/ttyACM0 试试。")
+                               "或在 extrinsics_config.py 里把 IMU_PORT 写死成 /dev/ttyACM0 试试。")
     else:
         print(f"  使用配置里写死的 {port}")
     print(f"  ✅ {port}")
@@ -182,7 +248,7 @@ def preflight():
     if tuple(cam.size) != (cfg.WIDTH, cfg.HEIGHT):
         raise RuntimeError(
             f"内参写的分辨率 {cam.size} 与本次采集的 {cfg.WIDTH}x{cfg.HEIGHT} 不一致。"
-            "改 capture_config.py 的 RESOLUTION，或换一份匹配的内参 —— 工具不会自动缩放。")
+            "改 extrinsics_config.py 的 RESOLUTION，或换一份匹配的内参 —— 工具不会自动缩放。")
     print(f"  ✅ 内参 {cam.size}，fx={cam.params[0]:.1f}")
 
     if not Path(cfg.TARGET_YAML).is_file():
@@ -196,26 +262,24 @@ def preflight():
     board = read_target(cfg.TARGET_YAML)
     print(f"  ✅ 标定板 {board['label']}")
     if board["kind"] in ("checkerboard", "chessboard"):
-        print("     ⚠️ 行列数必须和实物完全一致，否则检测出 0 帧。"
-              "数的是【内角点】，不是格子数。")
+        print("     ⚠️ 行列数必须和实物完全一致，否则检测出 0 帧。数的是【内角点】，不是格子数。")
     else:
         print("     ⚠️ tagRows/tagCols 是【tag 个数】不是内角点；tagSize 是黑框外沿，卡尺实测。")
         print(f"        按当前配置，整板 {board['board_m'][0] * 100:.1f}x"
-              f"{board['board_m'][1] * 100:.1f} cm —— 和实物对不上就是 0 帧，"
-              "而且平移会按比例错（tagSize 填错 10 倍 → 平移错 10 倍）。")
+              f"{board['board_m'][1] * 100:.1f} cm —— 和实物对不上就是 0 帧。")
 
     print("[4/4] 检查目录……")
     session_dir = Path(cfg.SESSION_DIR)
     if session_dir.exists() and any(session_dir.iterdir()):
         if auto_calibration_enabled() or not cfg.REUSE_EXISTING_SESSION:
             raise RuntimeError(
-                f"采集目录 {session_dir} 非空。请在 capture_config.py 改用新的 SESSION_NAME。")
+                f"采集目录 {session_dir} 非空。请在 extrinsics_config.py 改用新的 SESSION_NAME。")
         print("  ⚠️ 复用已有目录（REUSE_EXISTING_SESSION=True）")
     results_dir = Path(cfg.RESULTS_DIR)
     if results_dir.exists() and any(results_dir.iterdir()):
         if auto_calibration_enabled():
             raise RuntimeError(
-                f"标定结果目录 {results_dir} 非空。请在 capture_config.py 改用新的 SESSION_NAME。")
+                f"标定结果目录 {results_dir} 非空。请在 extrinsics_config.py 改用新的 SESSION_NAME。")
         print(f"  ⚠️ 结果目录 {results_dir} 非空 —— 标定程序会拒绝往里写，"
               "换个 SESSION_NAME 或把旧结果移走。")
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -262,15 +326,12 @@ def camera_command(device, target_info):
         "--exposure", str(cfg.EXPOSURE),
         "--white-balance", str(cfg.WHITE_BALANCE),
         "--gain", str(cfg.GAIN),
-        # 【2026-10-20】影响亮度的其余控件也从 capture_config 显式传下去，
-        # 不再让采集脚本自己取 vendor/calibration_config.py 的默认值。
         "--brightness", str(cfg.BRIGHTNESS),
         "--contrast", str(cfg.CONTRAST),
         "--sharpness", str(cfg.SHARPNESS),
         "--power-line-frequency", str(cfg.POWER_LINE_FREQUENCY),
         "--backlight-compensation", str(cfg.BACKLIGHT_COMPENSATION),
         "--cols", str(cols), "--rows", str(rows),
-        # 每帧都存：给一个远小于帧间隔的自动间隔，避免浮点比较漏掉某些帧
         "--auto-interval", f"{0.5 / cfg.FPS:.6f}",
         "--max-images", "0",
         "--duration", str(cfg.DURATION_S),
@@ -278,13 +339,7 @@ def camera_command(device, target_info):
 
 
 def _pump_with_timer(proc):
-    """边采集边报时：每秒一行"已过几秒 / 还剩几秒"。
-
-    相机子进程每存一张图就打一行 "保存 ..."，30 fps 会把控制台刷爆，所以这里把它
-    吞掉只计数；其它行（警告/错误/模式回读）照常转发。
-
-    最后 10 秒开始每秒响一次终端提示音，这样不用盯着屏幕也能知道快结束了。
-    """
+    """边采集边报时：每秒一行"已过几秒 / 还剩几秒"。"""
     import queue
     import threading
 
@@ -329,9 +384,6 @@ def _pump_with_timer(proc):
                 if len(parts) >= 2:
                     latest = parts[1]
             elif ln.strip() == "@记录开始@":
-                # 【2026-10-20 加】相机子进程锁定控件 + 曝光步进验证要花几秒，
-                # 倒计时从前面对齐到真正开始存图的那一刻，否则"还剩 25s"其实只剩 21s，
-                # 闭环的时长窗口整个错位。
                 t0 = time.monotonic()
                 last_beat = -1.0
                 beeped.clear()
@@ -346,7 +398,6 @@ def _pump_with_timer(proc):
         now = time.monotonic()
         elapsed = now - t0
         remain = duration - elapsed
-        # 每 2 秒读一张刚存的图算亮度和特征数 —— 太暗就当场看得出，不用走完才发现
         if cv2 is not None and latest and now - last_qual >= 2.0:
             last_qual = now
             img = cv2.imread(latest, cv2.IMREAD_GRAYSCALE)
@@ -364,7 +415,6 @@ def _pump_with_timer(proc):
             print(f"\r  [{elapsed:5.1f}s / {duration:g}s]  存图 {saved:4d}{tail}",
                   end="", flush=True)
 
-        # 最后 10 秒：每秒一声；1 秒时连响三声
         sec = int(round(remain))
         if 0 <= sec <= 10 and sec not in beeped:
             beeped.add(sec)
@@ -430,7 +480,7 @@ def record(device, port, target_info):
 
 
 # --------------------------------------------------------------------------
-# 报告
+# 报告与自动求解
 # --------------------------------------------------------------------------
 
 def report(imu_stats, cam_rc, img_stats, interrupted):
@@ -474,9 +524,6 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
                           f"gain {row.get('gain'):>4}  → 灰度 {row.get('mean')}{note}")
         except Exception:                                          # noqa: BLE001
             pass
-        # 【2026-10-20 加】termination 里带 failed 就是采集脚本自己判失败了
-        # （曝光没锁上 / 出流中断提前结束）。以前这种情况只打印不判死，
-        # 于是会带着一份时长不足的数据往下跑标定。
         if str(img_stats["manifest_termination"] or "").startswith("failed"):
             print("  ❌ 相机采集没正常完成，这次数据不要用")
 
@@ -485,33 +532,20 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
     if slow:
         print()
         print(f"  ⚠️ 实测 {img_stats['observed_fps']:.1f} fps，远低于请求的 {cfg.FPS} fps。")
-        print("     这不是相机的问题，是保存循环太慢。按可能性排：")
-        print("       1) SHOW_PREVIEW 是不是 True？那个 Tk/PIL 预览每帧要 ~300 ms")
-        print("       2) RESOLUTION 是不是 1080p？改成 720p 能省一半")
-        print("       3) 关掉 PyCharm 里别的吃 CPU 的东西")
-        print("     数据本身仍可用于标定（下限是 35 帧有效检出），但帧率越低越难转得平滑。")
+        print("     按可能性排查：1) SHOW_PREVIEW 是否开启 2) RESOLUTION 可改 720p 3) CPU 负载过高")
 
-    # 亮度 + 检出：预览关掉之后，这里是唯一的"眼睛"。
-    # 2026-10-15 那次 155 张 0 检出的教训：跑完标定才知道板子根本没进画面，
-    # 白等几分钟。所以采完就当场判。
     health = None
     health_level = None
     session_dir = Path(cfg.SESSION_DIR)
     images = sorted((session_dir / "cam0").glob("*.png"))
     board = read_target(cfg.TARGET_YAML) if Path(cfg.TARGET_YAML).is_file() else None
-    # 标定侧真正用的门槛要从 extrinsics_config 读，别在采集侧写死 ——
-    # 2026-10-16 踩过：这边 2.0、标定侧 3.5，同一份数据算出不同的"有效帧"。
     try:
-        import extrinsics_config as ec
-        pnp_gate = float(getattr(ec.SETTINGS, "max_pnp_rms_px", 2.0))
-        min_tags = int(getattr(ec.SETTINGS, "min_tags", 4))
+        pnp_gate = float(getattr(cfg.SETTINGS, "max_pnp_rms_px", 2.0))
+        min_tags = int(getattr(cfg.SETTINGS, "min_tags", 4))
     except Exception:                                          # noqa: BLE001
         pnp_gate, min_tags = 2.0, 4
     purpose = str(getattr(cfg, "CAPTURE_PURPOSE", "calibration")).lower()
     if images and board is not None and purpose == "vio":
-        # 【2026-10-20 加】VIO 采集是"拿着相机走场景"，画面里没有 AprilGrid，
-        # 检测器必然 0 检出。以前照样报 "0/20 检出" + 一整页"为什么一个 tag 都解不出"
-        # + 一轮 1~2 分钟的逐帧复算 —— 全是误导，还白等。这里只报亮度。
         b = image_health.brightness_stats(images, sample=20)
         print()
         print("画面体检（VIO 用途：画面里没有标定板，不做 tag 检出）")
@@ -526,9 +560,6 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
         print()
         print("画面体检")
         health = image_health.analyze(images, cfg.TARGET_YAML, sample=20)
-        # 再加一步"标定程序实际会用多少帧"。这一步才能在采完当场发现运动模糊 ——
-        # 静态的检出率和亮度都看不出糊，只有 PnP 残差看得出（2026-10-15 的教训：
-        # 检出 82%，但 17 帧 PnP 3~4 px 被剔，留出 5 处空洞，整份数据作废）。
         try:
             health["quality"] = image_health.calib_quality_stats(
                 images, cfg.CAMERA_YAML, cfg.TARGET_YAML, window=24,
@@ -538,9 +569,6 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
         health_level, health_actions = image_health.report(health)
         for action in health_actions:
             print(f"     → {action}")
-        # ★ 逐帧复算：把标定程序真正会接受哪些帧、以及【空洞结构】算出来。
-        # 采样 12 张的"检出率"预测不了 max_camera_gap_s —— 86% 检出率照样
-        # 可能被 4 处 0.5~1.9 秒的盲区毁掉（2026-10-15 白跑了三次标定，每次 5 分钟）。
         print()
         print("逐帧复算（跑标定程序自己的检测+PnP，约 1~2 分钟）……")
         try:
@@ -549,16 +577,9 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
             tl = image_health.full_timeline(
                 images, cfg.CAMERA_YAML, cfg.TARGET_YAML,
                 max_pnp_rms=pnp_gate, min_tags=min_tags, log=lambda *_a: None)
-            window_ok, window_note = image_health.report_timeline(tl)
+            window_ok, _window_note = image_health.report_timeline(tl)
             health["timeline"] = tl
             health["window_ok"] = window_ok
-            if window_ok and tl.get("best"):
-                a, span, n = tl["best"]
-                print()
-                print("  ★ 把 extrinsics_config.py 最下面那行 SETTINGS 换成：")
-                print(f"      SETTINGS = Settings(start_s={a:.2f}, max_duration_s={span:.2f},"
-                      " camera_rate_hz=60, max_pnp_rms_px=3.5)")
-                print(f"    （用 {a:.2f}s 起、{span:.2f} 秒、{n} 帧那一段）")
         except Exception as exc:                               # noqa: BLE001
             print(f"  （逐帧复算跳过：{exc}）")
 
@@ -584,15 +605,12 @@ def report(imu_stats, cam_rc, img_stats, interrupted):
 
     window_ok = bool(health and health.get("window_ok"))
     if health is not None and not window_ok:
-        print("❌ 逐帧复算：没有一段【连续】≥5 秒 且 ≥35 帧的可用窗口 ——")
-        print("   带着这份数据去跑标定，只会得到「成功检测标定板帧之间存在大空洞」")
-        print("   别浪费时间，直接重录。转动时让棋盘全程保持在画面中央、慢一点。")
+        print("❌ 逐帧复算：没有一段【连续】≥5 秒 且 ≥35 帧的可用窗口 —— 直接重录。")
         fatal = True
     if health is not None and health_level == "fail":
         d = health["detection"]
-        print(f"❌ 画面：{d['detected']}/{d['tried']} 检出（{100*d['rate']:.0f}%）"
-              " —— 带着这个去跑标定，只会得到「有效标定板帧只有 0」")
-        print("   先点 capture/framing_check.py 把取景和曝光调对，别浪费一轮采集")
+        print(f"❌ 画面：{d['detected']}/{d['tried']} 检出（{100 * d['rate']:.0f}%）")
+        print("   先点 capture/check_camera.py 把取景和曝光调对，别浪费一轮采集")
         fatal = True
     if not fatal and auto_calibration_enabled():
         print("✅ 两份 CSV 就绪；接下来由求解器逐帧检测标定板并检查残差与运动激励。")
@@ -624,8 +642,6 @@ def run_calibration():
         print(f"✅ 外参标定通过。结果和诊断见 {report_path}")
     return result.returncode
 
-
-# --------------------------------------------------------------------------
 
 def main():
     hr("相机–IMU 外参标定 · 采集")

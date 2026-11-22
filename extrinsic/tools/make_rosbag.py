@@ -18,9 +18,9 @@
     否则标定出来的时移立刻失效。
 
 用法（PyCharm 里直接点运行；也可以在终端跑）：
-    python capture/make_rosbag.py                    # 用最新的 session
-    python capture/make_rosbag.py --session session05
-    python capture/make_rosbag.py --list             # 看有哪些 session
+    python tools/make_rosbag.py                    # 用最新的 session
+    python tools/make_rosbag.py --session session05
+    python tools/make_rosbag.py --list             # 看有哪些 session
 """
 from __future__ import annotations
 
@@ -210,12 +210,10 @@ def main() -> int:
 
     print()
     print("下一步 —— 生成 OpenVINS 配置（如果还没生成）：")
-    print(f"  python prepare_openvins.py --calibration results/{name}_window \\")
+    print(f"  python tools/prepare_openvins.py --calibration results/{name} \\")
     print("      --template-config ~/vio_ws/final_config \\")
     print(f"      --output ~/calib/ov_config_{name} \\")
     print(f"      --imu-topic {IMU_TOPIC} --cam-topic {CAM_TOPIC}")
-    print()
-    print("再下一步 —— 跑 OpenVINS：见 capture/OPENVINS_HOWTO.md")
     return 0
 
 

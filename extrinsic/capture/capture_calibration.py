@@ -23,7 +23,11 @@ import time
 import cv2
 import numpy as np
 
-import calibration_config as config
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import extrinsics_config as config
 
 
 EXPECTED_VENDOR, EXPECTED_PRODUCT = "2bc5", "0511"

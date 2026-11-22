@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import calibrate_extrinsics
 from capture import record_session
-from capture.vendor import capture_calibration
+from capture import capture_calibration
 from calib.data import Camera, Target, read_yaml
 
 

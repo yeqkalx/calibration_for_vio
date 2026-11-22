@@ -1,63 +1,159 @@
-"""相机–IMU 标定默认设置。所有噪声值是权重初值，不是 CUAV 出厂参数。
-在 PyCharm 修改最下面 PATHS 并直接运行 calibrate_extrinsics.py；也支持命令行。
+"""相机–IMU 外参标定 · 唯一总配置文件
+
+本文件集中管理「现场采集 + 标定板与相机设置 + 离线标定求解」的所有默认参数。
+在 PyCharm 中只需修改本文件顶部的会话名与标定板类型，即可直接运行：
+  - capture/check_camera.py     （采前取景/曝光/标定板体检，或 --preview 实时预览）
+  - capture/record_session.py   （一键采集相机 + IMU，并在采集后自动标定）
+  - calibrate_extrinsics.py     （对已有 session 或 ROS bag 单独运行离线标定）
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, fields
-from pathlib import Path
 import math
+from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parent
 
+# ==========================================================================
+# 1. 当前会话与标定板（现场最常改的几项）
+# ==========================================================================
+SESSION_NAME = "session01"          # 每次重录或换板请改新的名字，避免覆盖旧数据
+CAPTURE_PURPOSE = "calibration"     # "calibration" = 标定采集；"vio" = 跑场景 VIO 数据采集
+RUN_CALIBRATION_AFTER = True        # True = 采集完成后自动调用离线标定求解
+REUSE_EXISTING_SESSION = False      # False = 目录非空时拒绝覆盖
+
+# 标定板类型：
+#   "aprilgrid"    -> configs/aprilgrid.yaml（tagCols/tagRows/tagSize/tagSpacing）
+#   "checkerboard" -> configs/checkerboard.yaml（cols/rows 内角点数 / square_size）
+TARGET_TYPE = "aprilgrid"
+if TARGET_TYPE not in ("checkerboard", "aprilgrid"):
+    raise ValueError('TARGET_TYPE 只能是 "checkerboard" 或 "aprilgrid"')
+TARGET_YAML = ROOT / "configs" / f"{TARGET_TYPE}.yaml"
+
+SESSION_DIR = ROOT / "data" / SESSION_NAME
+RESULTS_DIR = ROOT / "results" / SESSION_NAME
+
+# ==========================================================================
+# 2. 相机与自动测光参数（Orbbec Gemini Pro RGB UVC）
+# ==========================================================================
+CAMERA_USB_ID = "2bc5:0511"         # USB Vendor:Product，拒绝误用笔记本内置摄像头
+DEVICE = Path("/dev/video4")        # 默认 V4L2 节点（record_session 会按 USB ID 自动扫描）
+BACKEND = "auto"                    # "auto" 优先 V4L2 直采，失败回退 OpenCV；"v4l2" 禁止回退
+
+# 分辨率与相机内参严格绑定：
+#   "1080p"   -> configs/gemini_pro_rgb.yaml (1920x1080)
+#   "720p"    -> configs/gemini_pro_rgb_720p.yaml (1280x720)
+#   "640x480" -> configs/gemini_pro_rgb_640x480.yaml (640x480)
+RESOLUTION = "1080p"
+_RESOLUTION_TABLE = {
+    "1080p": (1920, 1080, ROOT / "configs" / "gemini_pro_rgb.yaml"),
+    "720p": (1280, 720, ROOT / "configs" / "gemini_pro_rgb_720p.yaml"),
+    "640x480": (640, 480, ROOT / "configs" / "gemini_pro_rgb_640x480.yaml"),
+}
+if RESOLUTION not in _RESOLUTION_TABLE:
+    raise ValueError(f"RESOLUTION 只能是 {sorted(_RESOLUTION_TABLE)} 之一，当前为 {RESOLUTION!r}")
+WIDTH, HEIGHT, CAMERA_YAML = _RESOLUTION_TABLE[RESOLUTION]
+
+FPS = 30
+EXPOSURE = 100                      # 单位 100 微秒（100 = 10 ms）
+WHITE_BALANCE = 4600                # 固定色温 (K)
+GAIN = 30
+BRIGHTNESS = 0
+CONTRAST = 32
+SHARPNESS = 3
+POWER_LINE_FREQUENCY = 1            # 0=关, 1=50Hz, 2=60Hz
+BACKLIGHT_COMPENSATION = 0          # 必须关（0），防止 AE 漏网时二次改测光
+
+# 进场自动测光与手动曝光步进验证
+SKIP_EXPOSURE_CHECK = False
+AUTO_EXPOSE = True
+AUTO_EXPOSE_TARGET = 100.0          # 目标灰度均值 (0..255)
+AUTO_EXPOSE_MIN_MEAN = 45.0         # 最低可用灰度均值，低于此值拒绝采集
+AUTO_EXPOSE_MAX_EXPOSURE_MS = 18.0  # 曝光绝对上限 (ms)
+AUTO_EXPOSE_BLUR_BUDGET_PX = 3.0    # 运动模糊预算 (px)：t_exp <= blur / (fx * ω)
+AUTO_EXPOSE_EXPECTED_RATE_DPS = 100.0               # VIO 模式预期角速度 (°/s)
+CALIBRATION_AUTO_EXPOSE_EXPECTED_RATE_DPS = 12.0    # 标定模式预期角速度 (°/s)
+AUTO_EXPOSE_MAX_GAIN = 40           # 测光增益上限
+ALLOW_DARK = False
+SHOW_PREVIEW = False                # 正式采集关预览以保 30fps；需要看画面请跑 capture/check_camera.py
+
+# 单机采图底层默认参数（供 capture_calibration.py 独立命令行调用时作为默认值）
+COLS = 8
+ROWS = 11
+AUTO_INTERVAL = 2.0
+DURATION = 90.0
+MAX_IMAGES = 40
+NO_PREVIEW = False
+READ_RETRIES = 10
+RETRY_INTERVAL = 0.5
+WARMUP_FRAMES = 10
+
+# ==========================================================================
+# 3. 飞控 IMU 采集参数（MAVLink HIGHRES_IMU）
+# ==========================================================================
+IMU_PORT = "auto"                   # "auto" 自动探测在发 MAVLink 的 ttyACM*/ttyUSB*
+IMU_REQUEST_HZ = 200                # 请求 HIGHRES_IMU 频率 (Hz)
+IMU_STARTUP_DISCARD_S = 2.0         # 开流初期丢弃秒数
+IMU_BAUD = 115200
+IMU_PRIME_S = 2.0                   # 相机开始前提前录 IMU 秒数
+IMU_TAIL_S = 0.5                    # 相机结束后顺延录 IMU 秒数
+IMU_CHECK_SECONDS = 10.0            # 单独运行 capture/imu_recorder.py 体检时的录制时长
+DURATION_S = 40.0                   # 正式采集时长 (s)
+
+# Kalibr 连续时间 IMU 噪声默认值（8 小时静置实测参考值，供 tools/run_kalibr.py 使用）
+IMU_NOISE_DEFAULTS = {
+    "update_rate": 200.3,
+    "gyroscope_noise_density": 6.0816e-05,
+    "accelerometer_noise_density": 4.2627e-04,
+    "gyroscope_random_walk": 7.1351e-06,
+    "accelerometer_random_walk": 1.4861e-05,
+}
+
+# ==========================================================================
+# 4. 离线标定求解器设置
+# ==========================================================================
 @dataclass
 class Settings:
-    knot_spacing_s: float = 0.04  # 均匀三次样条结点间距；更小能拟合更快的运动，耗时增加
-    max_duration_s: float = 30.0  # 每次标定一个连续窗口；多次用不同 start_s 独立验证
-    start_s: float = 0.0  # 相对于第一张输入图像
-    # 检测率与求解率分开：检测越密，越能看清"这段录像到底从哪到哪能标"。
-    # detect_rate_hz=0 表示每帧都检测。设成 15 能省一半时间，但 30fps 相机抽到 15Hz 后
-    # 窗口两端的帧会被丢掉 —— 实测 session11 的 5.36s 可用段被抽成 4.73s，低于
-    # min_duration_s 就被误判成"整段没有可用窗口"。省时间的代价是假失败，别随便调高。
-    detect_rate_hz: float = 0.0
-    camera_rate_hz: float = 15.0  # 进入求解的图像率上限（检测只负责找帧，求解才按这个率抽）
-    # 检出有空洞时自动挑最长的连续可用段；0 = 保持老行为，整段拒绝。
-    auto_window: int = 1
-    imu_rate_hz: float = 100.0  # 优化最高 IMU 率，只取原始样本，不做插值/滤波
-    max_offset_s: float = 0.10  # t_imu = t_cam + offset 的搜索边界
-    max_translation_m: float = 0.50  # T_cam_imu 各平移分量边界，按实际安装尺寸调整
-    image_sigma_px: float = 0.5  # 单坐标像素标准差，用于白化残差
-    gyro_sigma_rad_s: float = 0.01  # 保留的单个 IMU 样本标准差，非连续时间噪声密度
-    accel_sigma_m_s2: float = 0.10
-    gravity_m_s2: float = 9.80665  # 固定重力模长；优化重力方向
-    gravity_norm_sigma: float = 0.005  # 重力模长约束的标准差 m/s²
+    knot_spacing_s: float = 0.04        # 均匀三次样条结点间距 (s)
+    max_duration_s: float = 30.0        # 单次标定连续窗口上限 (s)
+    start_s: float = 0.0                # 相对于第一张输入图像的起始秒数
+    detect_rate_hz: float = 0.0         # 检测抽样率 Hz（0 = 逐帧检测，避免预抽帧切短连续段）
+    camera_rate_hz: float = 15.0        # 进入求解器的图像率上限 Hz（应 <= 相机帧率的一半）
+    auto_window: int = 1                # 1 = 检出有空洞时自动选最长合格连续段；0 = 整段拒绝
+    imu_rate_hz: float = 100.0          # 进入优化的最高原始 IMU 采样率 Hz
+    max_offset_s: float = 0.10          # t_imu = t_cam + offset 搜索边界 (s)
+    max_translation_m: float = 0.50     # T_cam_imu 各轴平移边界 (m)
+    image_sigma_px: float = 0.5         # 单坐标像素标准差（白化权重）
+    gyro_sigma_rad_s: float = 0.01      # 单个 IMU 陀螺样本标准差（白化权重，非连续噪声密度）
+    accel_sigma_m_s2: float = 0.10      # 单个 IMU 加计样本标准差（白化权重）
+    gravity_m_s2: float = 9.80665       # 当地重力模长 (m/s²)
+    gravity_norm_sigma: float = 0.005   # 重力模长约束标准差 (m/s²)
     max_gyro_bias_rad_s: float = 0.5
     max_accel_bias_m_s2: float = 2.0
     min_frames: int = 35
     min_duration_s: float = 5.0
-    max_camera_gap_s: float = 0.35  # 成功检测帧之间的最大空洞；超限拒绝跨洞拟合
+    max_camera_gap_s: float = 0.35      # 相邻有效检测帧最大允许间隔 (s)
     max_imu_gap_s: float = 0.05
-    min_rotation_std_rad_s: float = 0.05  # 角速度协方差第2特征方向的最低标准差
-    min_lever_singular: float = 0.15  # 杠杆臂回归矩阵最小归一化奇异值，单位 s^-2
-    min_target_depth_m: float = 0.01  # 数值保护下界；最终所有角点必须至少在相机前 1cm
-    depth_sigma_m: float = 0.001  # 优化试探步的可见性惩罚尺度，不是传感器噪声
+    min_rotation_std_rad_s: float = 0.05
+    min_lever_singular: float = 0.15
+    min_target_depth_m: float = 0.01
+    depth_sigma_m: float = 0.001
     max_pnp_rms_px: float = 2.0
-    # 1.0 这个门槛在这台相机上根本达不到：1080p 只有 MJPG 一种传输格式，8x8 块效应把角点
-    # 抖动到 ~1.5 px。实测"纯平面单应拟合"（不含镜头模型/不含 IMU/不含外参）在原始检测角点上
-    # 就是 1.57 px，所以 1.68 px 是量测噪声底，不是模型错。session05（棋盘格）同样是 1.68 px。
-    # 2.0 仍然是个有意义的门槛（明显劣化的数据会到 2.5 px 以上）。
-    max_reprojection_rms_px: float = 2.0  # 最终二维角点欧氏距离 RMS
-    max_gyro_rms_rad_s: float = 0.04  # 最终各轴合并 RMS
+    max_reprojection_rms_px: float = 2.0
+    max_gyro_rms_rad_s: float = 0.04
     max_accel_rms_m_s2: float = 0.40
-    min_tags: int = 8  # AprilGrid 一帧至少看到的 tag 数；只要 4 个点会挤在一角，平面 PnP 退化
-    april_corner_window_px: int = 4  # AprilTag 亚像素细化半窗；tag 在画面里 <60 px 时调回 2
-    max_points_per_frame: int = 150  # 均匀选取角点，0 表示全部；6x6 AprilGrid 一帧 144 个点
+    min_tags: int = 8                   # AprilGrid 单帧最少 tag 数
+    april_corner_window_px: int = 4     # AprilTag 亚像素细化半窗 (px)
+    max_points_per_frame: int = 150
     init_max_nfev: int = 80
     joint_max_nfev: int = 300
     optimizer_ftol: float = 1e-5
     optimizer_xtol: float = 1e-7
     optimizer_gtol: float = 1e-6
-    robust_scale: float = 2.5  # soft_l1 的白化残差尺度
+    robust_scale: float = 2.5
     seed: int = 7
-    save_detection_every: int = 20  # 每 N 张有效帧保存角点检查图，0=不保存
+    save_detection_every: int = 20
     verbose: int = 1
 
     def __post_init__(self):
@@ -72,16 +168,16 @@ class Settings:
                 raise ValueError(f"配置项 {field.name}: 无效数值 {value!r}") from exc
             if not math.isfinite(number):
                 raise ValueError(f"配置项 {field.name}: 必须为有限数值")
-            if field.type is int:
+            if field.type is int or field.type == "int":
                 if not number.is_integer():
                     raise ValueError(f"配置项 {field.name}: 必须为整数")
                 number = int(number)
             setattr(self, field.name, number)
-        # 允许取 0 的项：start_s 表示从头开始，detect_rate_hz=0 表示"每帧都检测"。
         nonnegative = {"start_s", "detect_rate_hz"}
         for field in fields(self):
             value = getattr(self, field.name)
-            if field.type is float and (value < 0 if field.name in nonnegative else value <= 0):
+            is_float = field.type is float or field.type == "float"
+            if is_float and (value < 0 if field.name in nonnegative else value <= 0):
                 raise ValueError(f"配置项 {field.name}: 必须 "
                                  f"{'>=0' if field.name in nonnegative else '>0'}")
         minima = {"min_frames": 3, "min_tags": 1, "april_corner_window_px": 1,
@@ -98,20 +194,18 @@ class Settings:
             if getattr(self, key) <= sys.float_info.epsilon:
                 raise ValueError(f"配置项 {key}: 必须大于机器精度")
 
-# PyCharm 入口相对路径
+
+# 离线标定默认路径（自动跟随顶部的 SESSION_NAME / RESOLUTION / TARGET_TYPE，也可通过 CLI 覆盖）
 PATHS = {
-    "camera": ROOT / "configs/gemini_pro_rgb.yaml",  # 建议换成自己的内参文件
-    "target": ROOT / "configs/aprilgrid.yaml",  # 尺寸必须实测！
-    "images": ROOT / "data/session14/images.csv",  # timestamp,filename
-    "imu": ROOT / "data/session14/imu.csv",  # timestamp,ax,ay,az,gx,gy,gz
-    "bag": None,  # ROS1 .bag / ROS2 bag 目录；设置后替代 images / imu
-    "output": ROOT / "results/session14",
+    "camera": CAMERA_YAML,
+    "target": TARGET_YAML,
+    "images": SESSION_DIR / "images.csv",
+    "imu": SESSION_DIR / "imu.csv",
+    "bag": None,
+    "output": RESULTS_DIR,
 }
 CAM_TOPIC = "/cam0/image_raw"
 IMU_TOPIC = "/imu0"
-IMAGE_TIMESTAMP_UNIT = "ns"  # ns / us / ms / s，必须明确
+IMAGE_TIMESTAMP_UNIT = "ns"
 IMU_TIMESTAMP_UNIT = "ns"
-# camera_rate_hz 必须 <= 相机实际帧率的一半左右，否则样条结点(0.04 s)比图像间隔(0.037 s)还密，
-# 初始化时控制点会在数据点之间乱振（实测：60 → 526 帧，样条加速度 max 7200 m/s²，标定必失败；
-# 15 → 263 帧，加速度 max 53 m/s²、角速度谱和陀螺对得上，初始化代价直接降到 0）。
 SETTINGS = Settings(camera_rate_hz=15, max_pnp_rms_px=3.5)

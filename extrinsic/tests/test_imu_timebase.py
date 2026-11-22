@@ -8,7 +8,7 @@ import unittest
 
 import numpy as np
 
-from capture.imu_timebase import anchor_timestamps, fit_timebase
+from capture.imu_recorder import anchor_timestamps, fit_timebase
 
 HZ = 200.0
 F0 = 1_000_000_000          # 飞控开机 1000 s，单位 µs
