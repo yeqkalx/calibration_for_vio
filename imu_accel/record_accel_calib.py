@@ -54,7 +54,7 @@ def _find_imu_src() -> Path:
 
 
 IMU_SRC = _find_imu_src()
-DATA_DIR = IMU_SRC / "data"
+DATA_DIR = HERE / "data"
 CALIB_TOOL = HERE / "accel_calib.py"
 
 # (代码名, 中文提示, 重力在机体系的方向)

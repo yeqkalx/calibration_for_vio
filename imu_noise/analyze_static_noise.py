@@ -50,9 +50,44 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE
-VENDOR = HERE / "vendor"
-sys.path.insert(0, str(VENDOR))
-from allan import allan_deviation, tau_grid  # noqa: E402
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+
+def tau_grid(n: int, dt: float, *, max_ratio: float = 0.25, pts_per_decade: int = 20) -> np.ndarray:
+    """对数等间距簇长 m，返回平均时间 tau = m * dt（秒）。"""
+    if n < 8:
+        raise ValueError(f"need at least 8 samples, got {n}")
+    m_max = max(2, int(n * max_ratio))
+    m = np.unique(
+        np.round(
+            np.logspace(0, np.log10(m_max), int(np.log10(m_max) * pts_per_decade) + 1)
+        ).astype(np.int64)
+    )
+    m = m[m >= 1]
+    return m.astype(np.float64) * dt
+
+
+def allan_deviation(x: np.ndarray, dt: float, taus: np.ndarray | None = None, **kw) -> tuple[np.ndarray, np.ndarray]:
+    """基于累积和 O(n) 计算重叠式 Allan 偏差 (taus, adev)。"""
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = x.size
+    if taus is None:
+        taus = tau_grid(n, dt, **kw)
+    taus = np.asarray(taus, dtype=np.float64)
+    c = np.concatenate(([0.0], np.cumsum(x)))
+    adev = np.empty(taus.size, dtype=np.float64)
+    for i, tau in enumerate(taus):
+        m = int(round(tau / dt))
+        if m < 1 or 2 * m > n:
+            adev[i] = np.nan
+            continue
+        n_pairs = n - 2 * m + 1
+        head = (c[m:m + n_pairs] - c[0:n_pairs]) / m
+        tail = (c[2 * m:2 * m + n_pairs] - c[m:m + n_pairs]) / m
+        d = tail - head
+        adev[i] = np.sqrt(0.5 * np.mean(d * d))
+    return taus, adev
 
 # ==========================================================================
 #  参数
@@ -682,6 +717,11 @@ def combine(results: dict, kind: str):
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     global SELFCHECK, PLOT
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    if "--self-test" in argv:
+        return 0 if run_selfcheck() else 1
     if "--skip-selfcheck" in argv:
         SELFCHECK = False
         argv = [a for a in argv if a != "--skip-selfcheck"]

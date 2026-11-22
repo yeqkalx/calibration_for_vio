@@ -30,39 +30,17 @@ F 为 3x3（含尺度与不正交），b 为 3x1 零偏。OpenVINS 里用的是�
 
 怎么采数据
 ----------
-用现成的 `imu/src/record_static_imu.py`（不需要相机）：
+方式 A（推荐，六面法 Ferraris）：
+    python imu_accel/record_accel_calib.py
+    按屏幕倒计时依次摆放 6 个正交面（肚子/背/机头/机尾/右/左），录完自动调用本脚本求解。
 
-    python imu/src/record_static_imu.py 120        # 录 120 秒
+方式 B（10~12 姿态椭球拟合 Ellipsoid）：
+    依次摆 10~12 个含倾斜的朝向，每个朝向静止 10~15 秒，然后运行：
+    python imu_accel/accel_calib.py --csv imu_accel/data/accelcal_YYYYmmdd_HHMMSS.csv --mode ellipsoid
 
-录的时候把 IMU 依次摆 **12 个朝向，每个朝向静止 10~15 秒**（见下表）。
-之所以要 12 个而不是 6 个：椭球（含中心）有 9 个参数，6 个点定不出来 ——
-设计矩阵是 6x9，秩必然小于 9，拟合结果不唯一。实测条件数：
-    6 个面        → 秩不足，不可用 ❌
-    10 个         → 条件数 6.1  ✅
-    12 个（下表） → 条件数 6.4  ✅
-    6 面+8 角=14  → 条件数 3.1  ✅✅（最好，但摆角很难）
-
-12 个姿态（"哪面朝下"用机体的鼻子/右侧/肚子描述，按你飞机的实际朝向改）：
-    1  正放（肚子朝下）              6  左侧朝下
-    2  倒放（背朝下）                7  头 + 右侧同时朝下（靠墙角）
-    3  头朝下（鼻子朝地）            8  头 + 左侧同时朝下
-    4  尾朝下                        9  尾 + 右侧同时朝下
-    5  右侧朝下                     10  尾 + 左侧同时朝下
-                                    11  肚子朝下、机头垫高约 45°
-                                    12  右侧朝下、肚子垫高约 45°
-
-⚠️ **只摆 6 个轴对齐朝向是不够的**：椭球有 9 个参数，6 个点定不出来，
-   会拟合出一个"恰好穿过这 6 个点"的错矩阵。本工具自检的实测对比：
-       6 姿态轴对齐  → 尺度误差 0.15%，不正交误差 2.9°   ❌
-       12 姿态带倾斜 → 尺度误差 0.006%，不正交误差 0.027° ✅
-
-然后：
-
-    python tools/accel_calib.py --csv imu/data/static_20261021_101500.csv
-
-自检（不需要任何硬件）：
-
-    python tools/accel_calib.py --self-test
+不传参数直接运行 `python imu_accel/accel_calib.py` 时，会自动读取 `imu_accel/data/`（或 `imu_noise/data/`）下最新的 `accelcal_*.csv`。
+离线自检（不需要任何硬件）：
+    python imu_accel/accel_calib.py --self-test
 """
 
 from __future__ import annotations
@@ -565,7 +543,16 @@ def main() -> int:
     elif args.csv:
         path = Path(args.csv).expanduser()
     else:
-        ap.error("要么 --csv / --session，要么 --self-test")
+        here = Path(__file__).resolve().parent
+        candidates = sorted(
+            [*here.glob("data/accelcal_*.csv"), *(here.parent / "imu_noise").glob("data/accelcal_*.csv")],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            ap.error("未找到默认 accelcal_*.csv；请先运行 record_accel_calib.py，或传 --csv / --session / --self-test")
+        path = candidates[0]
+        print(f"自动选择最新数据: {path}")
     if not path.exists():
         raise SystemExit(f"找不到 {path}")
 

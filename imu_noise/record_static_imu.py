@@ -50,11 +50,9 @@ REQUEST_HZ = 200.0      # 向飞控请求 HIGHRES_IMU 的速率
 HERE = Path(__file__).resolve().parent
 ROOT = HERE                              # imu_noise/
 OUT_DIR = ROOT / "data"
-VENDOR = HERE / "vendor"
 
-for _p in (str(HERE), str(VENDOR)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 from mavlink_min import MavlinkParser, pack          # noqa: E402
 from serial_port import open_port, find_mavlink_port, describe_candidates  # noqa: E402
 
@@ -326,6 +324,9 @@ def _parse_args(argv):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
     hours, probe = _parse_args(argv)
 
     print("=" * 74)

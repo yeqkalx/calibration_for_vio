@@ -85,7 +85,8 @@ def find_corners(gray, pattern):
     if hasattr(cv2, "findChessboardCornersSB"):
         # A consistent 180-degree reversal is absorbed by the view's pose, not
         # intrinsically a correspondence error. Skip EXHAUSTIVE for speed.
-        found, corners = cv2.findChessboardCornersSB(gray, pattern, cv2.CALIB_CB_NORMALIZE_IMAGE)
+        found, corners = cv2.findChessboardCornersSB(
+            gray, pattern, flags=cv2.CALIB_CB_NORMALIZE_IMAGE)
         if found:
             return corners.astype(np.float64)
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
