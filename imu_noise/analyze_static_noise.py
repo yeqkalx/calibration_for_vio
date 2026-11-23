@@ -123,12 +123,12 @@ TREND_MAX = 0.15
 # 任何基于曲线形状的判据都分不开它们。实测 EuRoC MH_01（飞行中、电机振动）
 # 会报出手册的 845 倍（陀螺）/ 59 倍（加计）—— 一颗 MEMS 不可能这么差，
 # 那读到的是振动，不是噪声。有了这道闸就变成"测不出"，而不是一个荒谬的数。
-# ⚠️ 这是**本设备**（IIM-42652）的合理性上界，不是通用判据；换 IMU 要改 DATASHEET。
+# ⚠️ 这是**本设备**（MicoAir743v2: BMI088 + BMI270）的合理性上界，不是通用判据；换 IMU 要改 DATASHEET。
 PLAUSIBLE_MAX_RATIO = 5.0
 PLOT = True
 SELFCHECK = True
 
-# 目前工作区里在用的值，用来做对比（不参与计算）
+# 目前工作区里在用的值，用来做对比（以及短时录制测不出随机游走时的兜底，不参与拟合计算）
 CURRENT = dict(
     gyroscope_noise_density=1.5700e-03,
     accelerometer_noise_density=2.5000e-03,
@@ -136,19 +136,18 @@ CURRENT = dict(
     accelerometer_random_walk=3.0000e-04,
     source="~/vio_ws/final_config/kalibr_imu_chain.yaml",
 )
-# 数据手册典型值，只用于"是否离谱"的对照，不参与计算。
-# 出处：IIM-42652 datasheet DS-000440 Rev 1.1
-#   Table 1 Gyroscope Specifications:
-#       Rate Noise Spectral Density @ 10 Hz = 0.0038 º/s/√Hz   (TYP, note 1 = tested in production)
-#       → 0.0038 × π/180 = 6.632e-05 rad/s/√Hz
-#   Table 2 Accelerometer Specifications:
-#       Power Spectral Density @ 10 Hz = 70 µg/√Hz            (TYP, note 1)
-#       → 70e-6 × 9.80665 = 6.865e-04 m/s²/√Hz
-#   手册自洽性检查：Total RMS Noise = 0.038 º/s-rms @ BW=100Hz
-#       → 0.0038×√100 = 0.038 ✓ ；RMS Noise = 0.70 mg-rms → 70e-6×√100 = 0.70 mg ✓
+# 数据手册典型值，只用于"是否离谱"的对照与上界门限，不参与拟合计算。
+# 当前飞控：MicoAir743v2（BMI088 + BMI270 双 IMU）；取两颗中底噪偏高者（BMI088）作基准，
+# 以确保无论 HIGHRES_IMU 走 BMI088、BMI270 还是双 IMU 融合都不会被合理性上界误杀：
+#   - BMI088 (Bosch Sensortec):
+#       Gyro Rate Noise Density  = 0.014 °/s/√Hz  → 0.014 × π/180 = 2.443e-04 rad/s/√Hz
+#       Accel Noise Density      = 175 µg/√Hz     → 175e-6 × 9.80665 = 1.716e-03 m/s²/√Hz
+#   - BMI270 (Bosch Sensortec，供参考):
+#       Gyro Rate Noise Density  = 0.007~0.010 °/s/√Hz → 1.222e-04~1.745e-04 rad/s/√Hz
+#       Accel Noise Density      = 160 µg/√Hz          → 1.569e-03 m/s²/√Hz
 DATASHEET = dict(
-    gyroscope_noise_density=6.632e-05,
-    accelerometer_noise_density=6.865e-04,
+    gyroscope_noise_density=2.443e-04,
+    accelerometer_noise_density=1.716e-03,
 )
 
 

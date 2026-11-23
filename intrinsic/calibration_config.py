@@ -38,7 +38,7 @@ BLACK_BORDER = None             # 只能是 None（自动）、2 或 1
 APRILGRID_MIN_TAGS = 4          # 单帧最少检出 tag 数（允许板子部分出画以覆盖四角，建议 4~8）
 APRIL_CORNER_WINDOW_PX = 4      # AprilTag 亚像素角点细化半窗（像素；远距离小 tag 可降至 2）
 
-SESSION_NAME = "session02"      # 每轮采集改用新的会话名，避免混用不同参数
+SESSION_NAME = "session05"      # 每轮采集改用新的会话名，避免混用不同参数
 
 SESSION_DIR = ROOT / "data" / SESSION_NAME
 IMAGES_DIR = SESSION_DIR / "cam0"

@@ -7,6 +7,7 @@ __pycache__/
 # 运行产物：数据 / 采集结果 / bag / 输出
 extrinsic/data/
 extrinsic/results/session*/
+extrinsic/results/kalibr/
 extrinsic/bags/
 extrinsic/vio_out/
 intrinsic/data/
