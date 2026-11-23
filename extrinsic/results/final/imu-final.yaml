@@ -1,8 +1,8 @@
-# Kalibr IMU continuous-time noise
+# Kalibr IMU continuous-time noise (2026-11-23 MicoAir743v2 0.5h static Allan)
 rostopic: /imu0
-update_rate: 200.3
+update_rate: 191.3
 
-accelerometer_noise_density: 4.2627e-04
-accelerometer_random_walk:   1.4861e-05
-gyroscope_noise_density:     6.0816e-05
-gyroscope_random_walk:       7.1351e-06
+accelerometer_noise_density: 1.0694e-03
+accelerometer_random_walk:   9.2162e-05
+gyroscope_noise_density:     9.7223e-05
+gyroscope_random_walk:       1.0000e-05

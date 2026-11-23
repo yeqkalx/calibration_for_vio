@@ -101,13 +101,13 @@ IMU_TAIL_S = 0.5                    # 相机结束后顺延录 IMU 秒数
 IMU_CHECK_SECONDS = 10.0            # 单独运行 capture/imu_recorder.py 体检时的录制时长
 DURATION_S = 40.0                   # 正式采集时长 (s)
 
-# Kalibr 连续时间 IMU 噪声默认值（8 小时静置实测参考值，供 tools/run_kalibr.py 使用）
+# Kalibr 连续时间 IMU 噪声默认值（2026-11-23 MicoAir743v2 0.5h 静置实测，供 tools/run_kalibr.py 使用）
 IMU_NOISE_DEFAULTS = {
-    "update_rate": 200.3,
-    "gyroscope_noise_density": 6.0816e-05,
-    "accelerometer_noise_density": 4.2627e-04,
-    "gyroscope_random_walk": 7.1351e-06,
-    "accelerometer_random_walk": 1.4861e-05,
+    "update_rate": 191.3,
+    "gyroscope_noise_density": 9.7223e-05,
+    "accelerometer_noise_density": 1.0694e-03,
+    "gyroscope_random_walk": 1.0000e-05,
+    "accelerometer_random_walk": 9.2162e-05,
 }
 
 # ==========================================================================
