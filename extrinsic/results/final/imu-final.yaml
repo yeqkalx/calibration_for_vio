@@ -1,5 +1,4 @@
-# Kalibr IMU 噪声（连续时间），数值 = 2026-10-17 八小时静置实测
-# 约定：离散噪声 std = noise_density × sqrt(fs)
+# Kalibr IMU continuous-time noise
 rostopic: /imu0
 update_rate: 200.3
 

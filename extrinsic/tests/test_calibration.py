@@ -128,6 +128,44 @@ class CalibrationTests(unittest.TestCase):
                     self.assertGreater(resid_upright, 50.0)   # 填 180 却用自拼板：必崩
                     self.assertLess(resid_rotated, 1.0)
 
+    def test_kalibr_border2_aprilgrid_with_corner_squares(self):
+        """Kalibr 标准 blackBorder=2 + 外角小黑方块 AprilGrid 应精确落到外角 X 交点，不内缩。"""
+        tgt = Target({"target_type": "aprilgrid", "tagRows": 3, "tagCols": 3,
+                      "tagSize": 0.088, "tagSpacing": 0.3, "tag_rotation_deg": 180,
+                      "blackBorder": 2}, min_tags=4)
+        tag_px, gap_px = 100, 30
+        pitch = tag_px + gap_px
+        margin = 60
+        side = margin * 2 + 2 * pitch + tag_px
+        image = np.full((side, side), 240, np.uint8)
+        for row in range(3):
+            for col in range(3):
+                tag_id = (2 - row) * 3 + col
+                tag = (cv2.aruco.generateImageMarker(tgt.dictionary, tag_id, tag_px, borderBits=2)
+                       if hasattr(cv2.aruco, "generateImageMarker")
+                       else cv2.aruco.drawMarker(tgt.dictionary, tag_id, tag_px, borderBits=2))
+                tag = np.rot90(tag, 2)
+                y0 = margin + row * pitch
+                x0 = margin + col * pitch
+                image[y0:y0 + tag_px, x0:x0 + tag_px] = tag
+        # 加上 Kalibr 外角小黑方块
+        for r in range(4):
+            for c in range(4):
+                cy = margin + r * pitch - gap_px
+                cx = margin + c * pitch - gap_px
+                image[cy:cy + gap_px, cx:cx + gap_px] = 0
+
+        points, uv = tgt.detect(image)
+        self.assertEqual(len(points), 36)
+        ppm = tag_px / 0.088
+        board_h_px = 2 * pitch + tag_px
+        expected = np.column_stack([
+            (margin - 0.5) + points[:, 0] * ppm,
+            (margin + board_h_px - 0.5) - points[:, 1] * ppm,
+        ])
+        rms = float(np.sqrt(np.mean(np.sum((uv - expected) ** 2, axis=1))))
+        self.assertLess(rms, 0.35)
+
     def test_opencv_yaml_and_inverse_export(self):
         from calib.solver import save_result
         from calib.data import read_yaml

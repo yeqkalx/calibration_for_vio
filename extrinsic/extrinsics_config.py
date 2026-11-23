@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 # ==========================================================================
 # 1. 当前会话与标定板（现场最常改的几项）
 # ==========================================================================
-SESSION_NAME = "session01"          # 每次重录或换板请改新的名字，避免覆盖旧数据
+SESSION_NAME = "session6"          # 每次重录或换板请改新的名字，避免覆盖旧数据
 CAPTURE_PURPOSE = "calibration"     # "calibration" = 标定采集；"vio" = 跑场景 VIO 数据采集
 RUN_CALIBRATION_AFTER = True        # True = 采集完成后自动调用离线标定求解
 REUSE_EXISTING_SESSION = False      # False = 目录非空时拒绝覆盖
@@ -121,12 +121,12 @@ class Settings:
     detect_rate_hz: float = 0.0         # 检测抽样率 Hz（0 = 逐帧检测，避免预抽帧切短连续段）
     camera_rate_hz: float = 15.0        # 进入求解器的图像率上限 Hz（应 <= 相机帧率的一半）
     auto_window: int = 1                # 1 = 检出有空洞时自动选最长合格连续段；0 = 整段拒绝
-    imu_rate_hz: float = 100.0          # 进入优化的最高原始 IMU 采样率 Hz
+    imu_rate_hz: float = 300.0          # 进入优化的最高原始 IMU 采样率 Hz（阈值 3.3ms，保留飞控 3.73/7.46ms 全部 ~192Hz 原始样本）
     max_offset_s: float = 0.10          # t_imu = t_cam + offset 搜索边界 (s)
     max_translation_m: float = 0.50     # T_cam_imu 各轴平移边界 (m)
     image_sigma_px: float = 0.5         # 单坐标像素标准差（白化权重）
-    gyro_sigma_rad_s: float = 0.01      # 单个 IMU 陀螺样本标准差（白化权重，非连续噪声密度）
-    accel_sigma_m_s2: float = 0.10      # 单个 IMU 加计样本标准差（白化权重）
+    gyro_sigma_rad_s: float = 0.01      # 单个 IMU 陀螺样本标准差（匹配手持样条残差尺度，避免 soft_l1 大面积饱和）
+    accel_sigma_m_s2: float = 0.10      # 单个 IMU 加计样本标准差（匹配手持样条残差尺度，避免 soft_l1 大面积饱和）
     gravity_m_s2: float = 9.80665       # 当地重力模长 (m/s²)
     gravity_norm_sigma: float = 0.005   # 重力模长约束标准差 (m/s²)
     max_gyro_bias_rad_s: float = 0.5

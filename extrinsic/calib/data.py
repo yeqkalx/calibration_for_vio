@@ -94,11 +94,138 @@ class Camera:
         return np.column_stack((fx*xd+cx, fy*yd+cy))
 
 
+def _sample_bilinear(img, xs, ys):
+    x0 = np.floor(xs).astype(np.int32)
+    y0 = np.floor(ys).astype(np.int32)
+    dx, dy = xs - x0, ys - y0
+    return (
+        img[y0, x0] * (1.0 - dx) * (1.0 - dy)
+        + img[y0, x0 + 1] * dx * (1.0 - dy)
+        + img[y0 + 1, x0] * (1.0 - dx) * dy
+        + img[y0 + 1, x0 + 1] * dx * dy
+    )
+
+
+def _refine_border2_quad(gray_u8, gray_f, quad, tag_spacing, subpix_win):
+    """精化 Kalibr 2-bit 黑边（10x10 码元）AprilTag 的外角点（抗角块粘连与强畸变）。"""
+    h, w = gray_f.shape
+    center = quad.mean(axis=0)
+    lines, edge_lengths = [], []
+    eff_spacing = max(float(tag_spacing), 0.15)
+    fracs = np.linspace(0.22, 0.78, 17)
+
+    for k in range(4):
+        p0, p1 = quad[k], quad[(k + 1) % 4]
+        edge = p1 - p0
+        length = float(np.linalg.norm(edge))
+        edge_lengths.append(length)
+        if length < 12.0:
+            return quad
+        tangent = edge / length
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+        if np.dot(normal, 0.5 * (p0 + p1) - center) < 0.0:
+            normal = -normal
+
+        d_in = -max(3.0, 0.04 * length)
+        d_out = max(6.0, min(0.16 * length, (0.08 + 0.5 * eff_spacing) * length))
+        n_steps = max(25, int(round((d_out - d_in) * 2.0)) + 1)
+        ds = np.linspace(d_in, d_out, n_steps)
+
+        bases = p0[None, :] + fracs[:, None] * edge[None, :]
+        xs = bases[:, 0:1] + ds[None, :] * normal[0]
+        ys = bases[:, 1:2] + ds[None, :] * normal[1]
+        valid_mask = (xs >= 1.0) & (xs < w - 2.0) & (ys >= 1.0) & (ys < h - 2.0)
+        if not np.any(valid_mask):
+            return quad
+        xs_c = np.clip(xs, 1.0, w - 2.001)
+        ys_c = np.clip(ys, 1.0, h - 2.001)
+        prof_all = _sample_bilinear(gray_f, xs_c, ys_c)
+
+        pts = []
+        for row_idx in range(len(prof_all)):
+            idx_v = np.flatnonzero(valid_mask[row_idx])
+            if len(idx_v) < 8:
+                continue
+            row = prof_all[row_idx, idx_v]
+            d_row = ds[idx_v]
+            m_len = len(row)
+            i_dark_end = max(3, int(0.35 * m_len))
+            i_bright_start = min(m_len - 3, int(0.55 * m_len))
+            v_dark = float(np.min(row[:i_dark_end]))
+            v_bright = float(np.max(row[i_bright_start:]))
+            if v_bright - v_dark < 15.0:
+                continue
+            thresh = 0.5 * (v_dark + v_bright)
+            i_bright = i_bright_start + int(np.argmax(row[i_bright_start:]))
+            cross_idx = None
+            for j in range(i_bright - 1, -1, -1):
+                if row[j] <= thresh < row[j + 1]:
+                    cross_idx = j
+                    break
+            if cross_idx is None:
+                continue
+            denom = float(row[cross_idx + 1] - row[cross_idx])
+            alpha = (thresh - float(row[cross_idx])) / denom if denom > 1e-6 else 0.5
+            d_edge = float(d_row[cross_idx] + alpha * (d_row[cross_idx + 1] - d_row[cross_idx]))
+            pts.append(bases[row_idx] + d_edge * normal)
+
+        if len(pts) < 5:
+            return quad
+        vx, vy, x0, y0 = cv2.fitLine(np.asarray(pts, dtype=np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        a, b = -float(vy), float(vx)
+        lines.append((a, b, -(a * float(x0) + b * float(y0))))
+
+    mean_len = float(np.mean(edge_lengths))
+    out = np.zeros((4, 2), dtype=np.float64)
+    for k in range(4):
+        a1, b1, c1 = lines[(k - 1) % 4]
+        a2, b2, c2 = lines[k]
+        det = a1 * b2 - a2 * b1
+        if abs(det) < 1e-9:
+            return quad
+        out[k, 0] = (b1 * c2 - b2 * c1) / det
+        out[k, 1] = (c1 * a2 - c2 * a1) / det
+        if np.linalg.norm(out[k] - quad[k]) > max(12.0, 0.35 * mean_len):
+            return quad
+
+    win = max(3, min(max(int(subpix_win), 5), int(round(0.08 * mean_len))))
+    probe_r = max(3.0, min(0.09, 0.35 * eff_spacing) * mean_len)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
+    max_shift = max(3.5, 0.06 * mean_len)
+
+    for k in range(4):
+        cx, cy = float(out[k, 0]), float(out[k, 1])
+        if cx < win + 2 or cx >= w - win - 2 or cy < win + 2 or cy >= h - win - 2:
+            continue
+        e_prev = out[k] - out[(k - 1) % 4]
+        e_next = out[k] - out[(k + 1) % 4]
+        u1 = e_prev / max(float(np.linalg.norm(e_prev)), 1e-6)
+        u2 = e_next / max(float(np.linalg.norm(e_next)), 1e-6)
+        probes = np.array([
+            out[k] - probe_r * (u1 + u2) * 0.6,
+            out[k] + probe_r * (u1 + u2) * 0.6,
+            out[k] + probe_r * (u1 - u2) * 0.6,
+            out[k] + probe_r * (u2 - u1) * 0.6,
+        ], dtype=np.float64)
+        if (
+            (probes[:, 0] >= 1.0).all() and (probes[:, 0] < w - 2.0).all()
+            and (probes[:, 1] >= 1.0).all() and (probes[:, 1] < h - 2.0).all()
+        ):
+            v_in, v_out, v_w1, v_w2 = _sample_bilinear(gray_f, probes[:, 0], probes[:, 1])
+            if min(float(v_w1), float(v_w2)) - max(float(v_in), float(v_out)) > 15.0:
+                pt = np.array([[[cx, cy]]], dtype=np.float32)
+                ref = cv2.cornerSubPix(gray_u8, pt, (win, win), (-1, -1), crit)[0, 0].astype(np.float64)
+                if np.linalg.norm(ref - out[k]) <= max_shift:
+                    out[k] = ref
+    return out
+
+
 class Target:
     def __init__(self, entry, min_tags=4, april_corner_window_px=2):
         self.entry = entry
         self.kind = entry["target_type"]
         self.min_tags = min_tags
+        self.april_corner_window_px = int(april_corner_window_px)
         if self.kind in ("checkerboard", "chessboard"):
             self.cols = int(entry.get("targetCols", entry.get("cols", 0)))
             self.rows = int(entry.get("targetRows", entry.get("rows", 0)))
@@ -120,6 +247,13 @@ class Target:
             self.tag_rotation = int(entry.get("tag_rotation_deg", 180))
             if self.tag_rotation % 90:
                 raise CalibrationError("tag_rotation_deg 只能是 0 / 90 / 180 / 270。")
+            raw_border = entry.get("blackBorder", entry.get("black_border", None))
+            if raw_border is None or (isinstance(raw_border, str) and raw_border.strip().lower() == "auto"):
+                self.black_border = None
+            elif isinstance(raw_border, bool) or int(raw_border) not in (1, 2):
+                raise CalibrationError("blackBorder 只能是 1、2 或 auto。")
+            else:
+                self.black_border = int(raw_border)
             self.roll = (self.tag_rotation // 90) % 4
             if min(self.rows, self.cols) < 1 or self.size <= 0 or self.spacing < 0:
                 raise CalibrationError("AprilGrid 行列/尺寸/间距无效。")
@@ -128,13 +262,28 @@ class Target:
             dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
             if self.first_id < 0 or self.first_id+self.rows*self.cols > len(dictionary.bytesList):
                 raise CalibrationError("AprilGrid tag ID 超出 36h11 字典。")
-            params = cv2.aruco.DetectorParameters() if hasattr(cv2.aruco, "DetectorParameters") else cv2.aruco.DetectorParameters_create()
+
+            def _make_params():
+                return cv2.aruco.DetectorParameters() if hasattr(cv2.aruco, "DetectorParameters") else cv2.aruco.DetectorParameters_create()
+
+            # Kalibr 标准 AprilGrid（blackBorder=2，10x10 码元）检测器
+            b2_params = _make_params()
+            b2_params.adaptiveThreshWinSizeMin = 5
+            b2_params.adaptiveThreshWinSizeStep = 4
+            b2_params.markerBorderBits = 2
+            b2_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+            self.border2_detector_params = b2_params
+            self.border2_detector = cv2.aruco.ArucoDetector(dictionary, b2_params) if hasattr(cv2.aruco, "ArucoDetector") else None
+
+            # 1-bit 黑边（OpenCV generateImageMarker 自拼板）检测器
+            params = _make_params()
             # 【2026-10-18 真机踩到】OpenCV 默认的多尺度二值化是 win 3,13,23（min=3, step=10）。
             # 打印板的黑框/码元和背景对比度不高（tag 黑 ≈25、白 ≈90），窗口 3 太小、步长 10 又太粗，
             # 结果整块板子一帧只认出 0~1 个 tag。改成 min=5、step=4（win 5,9,13,17,21）后，
             # 同一批图每帧稳定认出 19~36 个 tag。这两个参数直接决定能不能解出 ID，不要改回默认。
             params.adaptiveThreshWinSizeMin = 5
             params.adaptiveThreshWinSizeStep = 4
+            params.markerBorderBits = 1
             params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
             params.cornerRefinementWinSize = int(april_corner_window_px)  # avoid code-bit edges on small tags
             params.cornerRefinementMaxIterations = 40
@@ -154,6 +303,28 @@ class Target:
         quad = np.array([[x, y+s, 0], [x+s, y+s, 0], [x+s, y, 0], [x, y, 0]], float)
         return np.roll(quad, self.roll, axis=0) if self.roll else quad
 
+    def _detect_aruco(self, gray, detector, params, refine_border2=False):
+        if detector is None:
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary, parameters=params)
+        else:
+            corners, ids, _ = detector.detectMarkers(gray)
+        if ids is None:
+            return None
+        valid = [(int(i), c.reshape(4, 2).astype(float)) for i, c in zip(ids.ravel(), corners)
+                 if self.first_id <= int(i) < self.first_id+self.rows*self.cols]
+        if len({i for i, _ in valid}) != len(valid):
+            raise CalibrationError("检测到重复 tag ID；请移走额外 AprilTag。")
+        if len(valid) < self.min_tags:
+            return None
+        valid.sort(key=lambda v: v[0])
+        if refine_border2:
+            gray_f = gray.astype(np.float64)
+            valid = [
+                (i, _refine_border2_quad(gray, gray_f, q, self.spacing, self.april_corner_window_px))
+                for i, q in valid
+            ]
+        return np.concatenate([self.april_points(i) for i, _ in valid]), np.concatenate([c for _, c in valid]).astype(float)
+
     def detect(self, gray):
         if self.kind in ("checkerboard", "chessboard"):
             ok, pts = cv2.findChessboardCornersSB(gray, (self.cols, self.rows), flags=cv2.CALIB_CB_NORMALIZE_IMAGE)
@@ -163,20 +334,11 @@ class Target:
                     pts = cv2.cornerSubPix(gray, pts, (5, 5), (-1, -1),
                                           (cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4))
             return (self.points.copy(), pts.reshape(-1, 2).astype(float)) if ok else None
-        if self.detector is None:
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary, parameters=self.detector_params)
-        else:
-            corners, ids, _ = self.detector.detectMarkers(gray)
-        if ids is None:
-            return None
-        valid = [(int(i), c.reshape(4, 2)) for i, c in zip(ids.ravel(), corners)
-                 if self.first_id <= int(i) < self.first_id+self.rows*self.cols]
-        if len({i for i, _ in valid}) != len(valid):
-            raise CalibrationError("检测到重复 tag ID；请移走额外 AprilTag。")
-        if len(valid) < self.min_tags:
-            return None
-        valid.sort(key=lambda v: v[0])
-        return np.concatenate([self.april_points(i) for i, _ in valid]), np.concatenate([c for _, c in valid]).astype(float)
+        if self.black_border in (None, 2):
+            res2 = self._detect_aruco(gray, self.border2_detector, self.border2_detector_params, refine_border2=True)
+            if res2 is not None or self.black_border == 2:
+                return res2
+        return self._detect_aruco(gray, self.detector, self.detector_params, refine_border2=False)
 
 
 @dataclass

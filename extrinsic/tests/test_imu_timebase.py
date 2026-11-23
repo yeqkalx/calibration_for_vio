@@ -75,6 +75,29 @@ class TimebaseTests(unittest.TestCase):
         err = np.asarray(stamps, dtype=float)-truth
         self.assertLess(abs(err[-1]-err[0])/1e6, 0.5)
 
+    def test_accepts_real_fc_crystal_drift(self):
+        """实机飞控存在稳定的 -1230 ppm 晶振频偏，应被正确拟合锚定而不是退回 read_time。"""
+        rng = np.random.default_rng(7)
+        n = int(40.0*HZ)
+        delay = np.where(rng.random(n) < 0.25, rng.uniform(2, 12, n), 0.0)
+        fc, host, prov = synthetic(40.0, delay_ms=delay, const_ms=5.0,
+                                   jitter_ms=0.15, drift_ppm=-1230.0)
+        stamps, info = anchor_timestamps(fc, host, prov)
+        self.assertTrue(info["ok"], info.get("reason"))
+        self.assertAlmostEqual(info["drift_ppm"], -1230.0, delta=25.0)
+        # 映射到宿主实时时钟后，首尾与真实宿主无延迟到达时间不应有残余斜率
+        true_host = np.array(fc, dtype=float)*1000*(1.0 - 1230.0*1e-6) + 5.0e6
+        err = np.asarray(stamps, dtype=float) - true_host
+        self.assertLess(spread(err)/1e6, 2.0)
+
+    def test_rejects_extreme_clock_drift(self):
+        """超过阈值（如 5000 ppm）的异常频偏仍应拒绝并回退。"""
+        fc, host, prov = synthetic(10.0, const_ms=2.0, jitter_ms=0.1, drift_ppm=5000.0)
+        stamps, info = anchor_timestamps(fc, host, prov)
+        self.assertFalse(info["ok"])
+        self.assertEqual(stamps, prov)
+        self.assertIn("ppm", info["reason"])
+
     def test_falls_back_without_fc_time(self):
         fc = [0]*int(2.0*HZ)
         host = [int(1.7e18+i*5e6) for i in range(len(fc))]

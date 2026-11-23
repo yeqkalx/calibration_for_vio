@@ -29,12 +29,17 @@ import re
 import shutil
 import subprocess
 import sys
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent          # extrinsic/
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from extrinsics_config import IMU_NOISE_DEFAULTS as IMU_DEFAULTS  # noqa: E402
+from extrinsics_config import (  # noqa: E402
+    CAMERA_YAML as DEFAULT_CAMERA_YAML,
+    IMU_NOISE_DEFAULTS as IMU_DEFAULTS,
+    TARGET_TYPE as DEFAULT_TARGET_TYPE,
+)
 
 DATA = ROOT / "data"
 BAGS = ROOT / "bags"
@@ -44,7 +49,6 @@ LOGS = RES / "_logs"
 
 MOUNT = "/data"
 IMAGE = "kalibr:latest"
-TARGET_APRILGRID = dict(rows=6, cols=6, tag_size=0.088, tag_spacing=0.56)
 
 
 def info(msg: str = "") -> None:
@@ -79,36 +83,113 @@ def resolve_session(arg: str | None) -> str:
     return arg
 
 
-def resolve_board_size(args) -> tuple[int, int]:
-    if args.rows is not None and args.cols is not None:
-        return args.rows, args.cols
-    if args.target_type == "aprilgrid":
-        r, c = TARGET_APRILGRID["rows"], TARGET_APRILGRID["cols"]
+def _resolve_config_path(path: Path) -> Path:
+    expanded = Path(path).expanduser()
+    if expanded.is_absolute():
+        return expanded
+    if expanded.is_file():
+        return expanded.resolve()
+    return (ROOT / expanded).resolve()
+
+
+def _load_target_yaml(path: Path) -> dict:
+    resolved = _resolve_config_path(path)
+    if not resolved.is_file():
+        fail(f"找不到标定板配置文件：{resolved}")
+    text = resolved.read_text(encoding="utf-8-sig")
+    cleaned = "\n".join(line for line in text.splitlines() if not line.startswith("%YAML:"))
+    try:
+        data = yaml.safe_load(cleaned)
+    except yaml.YAMLError as exc:
+        fail(f"解析标定板 YAML 失败（{resolved}）：{exc}")
+    if not isinstance(data, dict):
+        fail(f"标定板 YAML 格式无效（顶层应为键值映射）：{resolved}")
+    return data
+
+
+def _normalize_target_type(raw: object, src: Path) -> str:
+    if not isinstance(raw, str):
+        fail(f"标定板 YAML 缺少有效的 target_type：{src}")
+    norm = raw.strip().lower()
+    if norm in ("checkerboard", "chessboard"):
+        return "checkerboard"
+    if norm == "aprilgrid":
+        return "aprilgrid"
+    fail(f"不支持的标定板类型 {raw!r}（{src}），仅支持 aprilgrid 或 checkerboard")
+
+
+def _require_key(cfg: dict, keys: tuple[str, ...], label: str, src: Path):
+    for key in keys:
+        if key in cfg and cfg[key] is not None:
+            return cfg[key]
+    fail(f"标定板配置 {src} 缺少字段 {label}（可接受键名：{', '.join(keys)}）")
+
+
+def make_target_yaml(args) -> tuple[str, str]:
+    if args.target is not None:
+        src = _resolve_config_path(args.target)
+        cfg = _load_target_yaml(src)
+        target_type = _normalize_target_type(cfg.get("target_type"), src)
+        if args.target_type is not None and args.target_type != target_type:
+            fail(f"--target-type={args.target_type} 与 --target ({src}) 的 target_type={target_type} 不一致")
     else:
-        r, c = 11, 8
-    return (args.rows if args.rows is not None else r,
-            args.cols if args.cols is not None else c)
+        target_type = args.target_type or DEFAULT_TARGET_TYPE
+        src = ROOT / "configs" / f"{target_type}.yaml"
+        cfg = _load_target_yaml(src)
+        yaml_type = _normalize_target_type(cfg.get("target_type"), src)
+        if yaml_type != target_type:
+            fail(f"{src} 的 target_type={yaml_type} 与期望的 {target_type} 不一致")
 
+    try:
+        src_label = str(src.relative_to(ROOT))
+    except ValueError:
+        src_label = str(src)
 
-def make_target_yaml(args) -> str:
-    rows, cols = resolve_board_size(args)
-    if args.target_type == "aprilgrid":
-        return (
-            "# Kalibr AprilGrid (tag36h11)\n"
+    if target_type == "aprilgrid":
+        rows = args.rows if args.rows is not None else int(_require_key(cfg, ("tagRows",), "tagRows", src))
+        cols = args.cols if args.cols is not None else int(_require_key(cfg, ("tagCols",), "tagCols", src))
+        tag_size = (
+            args.tag_size
+            if args.tag_size is not None
+            else float(_require_key(cfg, ("tagSize",), "tagSize", src))
+        )
+        tag_spacing = (
+            args.tag_spacing
+            if args.tag_spacing is not None
+            else float(_require_key(cfg, ("tagSpacing",), "tagSpacing", src))
+        )
+        if rows < 1 or cols < 1 or tag_size <= 0 or tag_spacing < 0:
+            fail(f"AprilGrid 参数无效：rows={rows}, cols={cols}, tagSize={tag_size}, tagSpacing={tag_spacing}")
+        yaml_text = (
+            f"# Kalibr AprilGrid (tag36h11), from {src_label}\n"
             "target_type: 'aprilgrid'\n"
             f"tagRows: {rows}\n"
             f"tagCols: {cols}\n"
-            f"tagSize: {args.tag_size}\n"
-            f"tagSpacing: {args.tag_spacing}\n"
+            f"tagSize: {tag_size}\n"
+            f"tagSpacing: {tag_spacing}\n"
         )
-    return (
-        "# Kalibr checkerboard\n"
+        summary = f"aprilgrid {rows}x{cols}, tagSize={tag_size:g}m, tagSpacing={tag_spacing:g}（来源 {src_label}）"
+        return yaml_text, summary
+
+    rows = args.rows if args.rows is not None else int(_require_key(cfg, ("targetRows", "rows"), "rows/targetRows", src))
+    cols = args.cols if args.cols is not None else int(_require_key(cfg, ("targetCols", "cols"), "cols/targetCols", src))
+    if args.square_size is not None:
+        row_spacing = col_spacing = float(args.square_size)
+    else:
+        row_spacing = float(_require_key(cfg, ("rowSpacingMeters", "square_size"), "square_size/rowSpacingMeters", src))
+        col_spacing = float(_require_key(cfg, ("colSpacingMeters", "square_size"), "square_size/colSpacingMeters", src))
+    if rows < 2 or cols < 2 or row_spacing <= 0 or col_spacing <= 0:
+        fail(f"棋盘格参数无效：cols={cols}, rows={rows}, spacing={col_spacing}x{row_spacing}")
+    yaml_text = (
+        f"# Kalibr checkerboard, from {src_label}\n"
         "target_type: 'checkerboard'\n"
         f"targetCols: {cols}\n"
         f"targetRows: {rows}\n"
-        f"rowSpacingMeters: {args.square_size}\n"
-        f"colSpacingMeters: {args.square_size}\n"
+        f"rowSpacingMeters: {row_spacing}\n"
+        f"colSpacingMeters: {col_spacing}\n"
     )
+    summary = f"checkerboard {cols}x{rows}, spacing={col_spacing:g}x{row_spacing:g}m（来源 {src_label}）"
+    return yaml_text, summary
 
 
 def make_imu_yaml() -> str:
@@ -124,23 +205,28 @@ def make_imu_yaml() -> str:
     )
 
 
-def make_camchain_yaml(args) -> str | None:
-    src = Path(args.camchain) if args.camchain else (ROOT / "configs" / "gemini_pro_rgb.yaml")
-    if not src.is_absolute():
-        src = (ROOT / src).resolve()
+def make_camchain_yaml(args) -> tuple[str | None, Path]:
+    src = _resolve_config_path(args.camchain) if args.camchain else DEFAULT_CAMERA_YAML
     if not src.is_file():
-        return None
-    return src.read_text(encoding="utf-8")
+        return None, src
+    return src.read_text(encoding="utf-8"), src
 
 
 def ensure_configs(args) -> None:
     info("配置：")
-    (CONF / "target.yaml").write_text(make_target_yaml(args), encoding="utf-8")
+    target_yaml, target_summary = make_target_yaml(args)
+    (CONF / "target.yaml").write_text(target_yaml, encoding="utf-8")
     (CONF / "imu.yaml").write_text(make_imu_yaml(), encoding="utf-8")
-    cam = make_camchain_yaml(args)
+    cam, cam_src = make_camchain_yaml(args)
     if cam is None:
-        fail("找不到 configs/gemini_pro_rgb.yaml（相机内参），请用 --camchain 指定")
+        fail(f"找不到相机内参文件 {cam_src}，请检查 extrinsics_config.py 或用 --camchain 指定")
     (CONF / "camchain.yaml").write_text(cam, encoding="utf-8")
+    try:
+        cam_label = str(cam_src.relative_to(ROOT))
+    except ValueError:
+        cam_label = str(cam_src)
+    info(f"  标定板：{target_summary}")
+    info(f"  相机  ：{cam_label}")
     info(f"  已生成运行配置于 {CONF.relative_to(ROOT)}/")
 
 
@@ -326,14 +412,17 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="session 名（默认用 data/ 下最新一个）")
     ap.add_argument("--rebuild", action="store_true", help="强制重新打 bag")
     ap.add_argument("--no-verify", action="store_true", help="跳过 bag 话题校验")
+    ap.add_argument("--target", type=Path, default=None,
+                    help="标定板 YAML 路径（默认按 extrinsics_config.TARGET_TYPE 读取 configs/<type>.yaml）")
     ap.add_argument("--target-type", choices=["aprilgrid", "checkerboard"],
-                    default="aprilgrid", help="标定板类型（默认 aprilgrid）")
-    ap.add_argument("--rows", type=int, default=None)
-    ap.add_argument("--cols", type=int, default=None)
-    ap.add_argument("--tag-size", type=float, default=TARGET_APRILGRID["tag_size"])
-    ap.add_argument("--tag-spacing", type=float, default=TARGET_APRILGRID["tag_spacing"])
-    ap.add_argument("--square-size", type=float, default=0.03)
-    ap.add_argument("--camchain", type=Path, default=None)
+                    default=None, help=f"标定板类型（默认跟随 extrinsics_config：{DEFAULT_TARGET_TYPE}）")
+    ap.add_argument("--rows", type=int, default=None, help="覆盖标定板行数")
+    ap.add_argument("--cols", type=int, default=None, help="覆盖标定板列数")
+    ap.add_argument("--tag-size", type=float, default=None, help="[AprilGrid] 覆盖单个 tag 边长（米）")
+    ap.add_argument("--tag-spacing", type=float, default=None, help="[AprilGrid] 覆盖 tagSpacing（间隙/边长）")
+    ap.add_argument("--square-size", type=float, default=None, help="[棋盘格] 覆盖方格边长（米）")
+    ap.add_argument("--camchain", type=Path, default=None,
+                    help=f"相机内参 YAML（默认跟随 extrinsics_config：{DEFAULT_CAMERA_YAML.name}）")
     ap.add_argument("--from-to", nargs=2, type=float, metavar=("T0", "T1"))
     return ap.parse_args(argv)
 

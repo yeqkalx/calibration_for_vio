@@ -39,7 +39,9 @@ CSV_HEADER = ["timestamp", "ax", "ay", "az", "gx", "gy", "gz"]
 
 # 下包络拟合常数
 _FLOOR_QUANTILE = 0.001
-_MAX_DRIFT_PPM = 500.0
+# 实测飞控与宿主机晶振存在稳定的 -1227~-1230 ppm 频偏（约 -0.123%），
+# 500 ppm 会误拒真实飞控时钟并退回 read_time；2500 ppm 覆盖实机频偏且仍拦截异常时钟。
+_MAX_DRIFT_PPM = 2500.0
 _MAX_SHIFT_NS = 5_000_000_000
 
 
