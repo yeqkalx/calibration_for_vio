@@ -46,9 +46,14 @@ def list_candidates():
         except ImportError:
             return []
         ports = list(list_ports.comports())
-        # CUAV 7-Nano 的 USB ID 是 1209:5740
-        preferred = [p.device for p in ports
-                     if (p.vid == 0x1209) or "CUAV" in (p.description or "").upper()]
+        # 优先挑常见飞控 USB CDC 设备：CUAV (0x1209)、MicoAir (0x1b8c)、PX4/3DR (0x26ac)
+        _FC_VIDS = {0x1209, 0x1B8C, 0x26AC}
+        _FC_KEYWORDS = ("CUAV", "MICOAIR", "PX4", "PIXHAWK", "FMU", "ARDUPILOT")
+        preferred = [
+            p.device for p in ports
+            if (p.vid in _FC_VIDS)
+            or any(k in (p.description or "").upper() for k in _FC_KEYWORDS)
+        ]
         others = [p.device for p in ports if p.device not in preferred]
         return preferred + others
 
@@ -193,16 +198,17 @@ def open_port(name: str, baud: int = DEFAULT_BAUD) -> Port:
 
 def find_mavlink_port(candidates=None, timeout: float = 1.5, baud: int = DEFAULT_BAUD,
                       log=print):
-    """逐个监听候选串口，返回第一个真的在讲 MAVLink 的口。
+    """逐个探测候选串口，返回第一个真的在讲 MAVLink 的口。
 
-    只看不发（纯粹听 1.5 秒），对飞控没有任何副作用。
+    先纯被动监听一小段（兼容 ArduPilot 等主动发流的飞控）；若期间静默，
+    则发一帧标准 GCS HEARTBEAT 唤醒等待地面站心跳的飞控（如 PX4 / MicoAir USB CDC）。
     """
     import sys as _sys
     _here = os.path.dirname(os.path.abspath(__file__))
     for cand in (_here, os.path.join(_here, "vendor")):
         if cand not in _sys.path:
             _sys.path.insert(0, cand)
-    from mavlink_min import MavlinkParser
+    from mavlink_min import MavlinkParser, pack
 
     candidates = list(candidates) if candidates else list_candidates()
     if not candidates:
@@ -214,7 +220,12 @@ def find_mavlink_port(candidates=None, timeout: float = 1.5, baud: int = DEFAULT
             log("    → 飞控插好了吗？换个 USB 口？（避开 hub）")
         return None
 
-    log(f"  串口候选 {candidates}，逐个监听 {timeout:g}s……")
+    hb_v2 = pack(0, {"type": 6, "autopilot": 8, "system_status": 4, "mavlink_version": 3},
+                 sysid=255, compid=190, seq=0, version=2)
+    hb_v1 = pack(0, {"type": 6, "autopilot": 8, "system_status": 4, "mavlink_version": 3},
+                 sysid=255, compid=190, seq=1, version=1)
+
+    log(f"  串口候选 {candidates}，逐个探测 {timeout:g}s……")
     for name in candidates:
         try:
             port = open_port(name, baud)
@@ -227,16 +238,38 @@ def find_mavlink_port(candidates=None, timeout: float = 1.5, baud: int = DEFAULT
             continue
         parser = MavlinkParser()
         seen = {}
-        deadline = time.monotonic() + timeout
+        t0 = time.monotonic()
+        deadline = t0 + timeout
+        wake_v2_at = t0 + min(0.35, timeout * 0.25)
+        wake_v1_at = t0 + min(0.85, timeout * 0.55)
+        sent_v2 = False
+        sent_v1 = False
         try:
-            while time.monotonic() < deadline:
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                if not seen:
+                    if not sent_v2 and now >= wake_v2_at:
+                        try:
+                            port.write(hb_v2)
+                        except Exception:                               # noqa: BLE001
+                            pass
+                        sent_v2 = True
+                    elif not sent_v1 and now >= wake_v1_at:
+                        try:
+                            port.write(hb_v1)
+                        except Exception:                               # noqa: BLE001
+                            pass
+                        sent_v1 = True
                 data = port.read(4096)
                 for frame in parser.feed(data or b""):
                     seen[frame.name] = seen.get(frame.name, 0) + 1
         finally:
             port.close()
         if seen:
-            log(f"    {name}: ✅ 收到 {sum(seen.values())} 帧 {sorted(seen)}")
+            woke = "（GCS 心跳唤醒）" if (sent_v2 or sent_v1) else ""
+            log(f"    {name}: ✅ 收到 {sum(seen.values())} 帧{woke} {sorted(seen)}")
             return name
         log(f"    {name}: 静默（没有有效 MAVLink 帧）")
 

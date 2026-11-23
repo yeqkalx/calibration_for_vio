@@ -111,6 +111,7 @@ class Recorder:
             print(f"\n  ✅ 串口已打开 {self.port}（USB CDC，波特率设置无实际作用）")
             print(f"  正在请求 HIGHRES_IMU @ {self.request_hz:g} Hz ……")
             n_seq = 0
+            n_wake = 0
             t_open = time.monotonic()
             t_next_flush = t_open + FLUSH_EVERY_S
             t_next_fsync = t_open + FSYNC_EVERY_S
@@ -126,7 +127,8 @@ class Recorder:
                         break
 
                     # 收到飞控 HEARTBEAT 后按同一 MAVLink 版本（v1/v2）发 GCS 心跳和速率请求；
-                    # 若超过 0.5 s 仍未收到心跳，兜底向 (1, 1) 发一次请求。
+                    # 若超过 0.3 s 仍未收到心跳（如 PX4 USB CDC 等待 GCS 心跳唤醒），主动发 GCS 心跳，
+                    # 超过 0.6 s 仍无响应再兜底向 (1, 1) 发一次速率请求。
                     if self._target is not None:
                         if now >= self._next_heartbeat:
                             n_seq = self._send_heartbeat(port, n_seq)
@@ -136,9 +138,15 @@ class Recorder:
                         if now >= self._next_req:
                             n_seq = self._request_interval(port, n_seq, self._target)
                             self._next_req = now + 2.0
-                    elif now - t_open >= 0.5 and now >= self._next_req:
-                        n_seq = self._request_interval(port, n_seq, (1, 1))
-                        self._next_req = now + 2.0
+                    else:
+                        if now - t_open >= 0.3 and now >= self._next_heartbeat:
+                            wake_ver = 2 if (n_wake % 2 == 0) else 1
+                            n_seq = self._send_heartbeat(port, n_seq, version=wake_ver)
+                            n_wake += 1
+                            self._next_heartbeat = now + 1.0
+                        if now - t_open >= 0.6 and now >= self._next_req:
+                            n_seq = self._request_interval(port, n_seq, (1, 1))
+                            self._next_req = now + 2.0
 
                     try:
                         data = port.read(8192)
@@ -176,12 +184,13 @@ class Recorder:
         self.stats["wall_seconds"] = time.time() - t_start
 
     # ---- 内部 ----
-    def _send_heartbeat(self, port, n_seq: int) -> int:
+    def _send_heartbeat(self, port, n_seq: int, version: int | None = None) -> int:
         try:
             port.write(pack(0, {
                 "type": 6, "autopilot": 8,
                 "system_status": 4, "mavlink_version": 3,
-            }, sysid=255, compid=190, seq=n_seq & 0xFF, version=self._version))
+            }, sysid=255, compid=190, seq=n_seq & 0xFF,
+                version=self._version if version is None else version))
             return n_seq + 1
         except Exception:                                                # noqa: BLE001
             return n_seq

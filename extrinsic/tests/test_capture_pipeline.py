@@ -209,6 +209,81 @@ class CapturePipelineTests(unittest.TestCase):
         self.assertEqual(stats.get("timestamp_anchor"), "read_time")
         self.assertTrue(all(b > a for a, b in zip(ts, ts[1:])))
 
+    def test_px4_silent_until_gcs_heartbeat(self):
+        """PX4 USB CDC stays silent until it receives a GCS HEARTBEAT."""
+        import select as _select
+
+        def _fake_px4_fc(master_fd, stop):
+            rx = MavlinkParser()
+            awake = False
+            seq = 0
+            t0 = 2_000_000_000
+            started = time.monotonic()
+            while not stop.is_set():
+                r, _, _ = _select.select([master_fd], [], [], 0.02)
+                if r:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except BlockingIOError:
+                        data = b""
+                    for f in rx.feed(data):
+                        if f.name == "HEARTBEAT":
+                            awake = True
+                if awake:
+                    try:
+                        os.write(master_fd, pack(0, {"type": 2, "autopilot": 12, "mavlink_version": 3},
+                                                 sysid=1, compid=1, seq=seq & 0xFF))
+                        seq += 1
+                        os.write(master_fd, pack(105, {
+                            "time_usec": t0 + int((time.monotonic() - started) * 1e6),
+                            "xacc": 0.0, "yacc": 0.0, "zacc": -9.81,
+                            "xgyro": 0.0, "ygyro": 0.0, "zgyro": 0.0,
+                            "fields_updated": 0x3F, "id": 0,
+                        }, sysid=1, compid=1, seq=seq & 0xFF))
+                        seq += 1
+                    except BlockingIOError:
+                        pass
+                    time.sleep(0.01)
+
+        # 1) find_mavlink_port wakes it up
+        master, slave = pty.openpty()
+        slave_path = os.ttyname(slave)
+        _configure_raw(slave)
+        os.set_blocking(master, False)
+        stop = threading.Event()
+        th = threading.Thread(target=_fake_px4_fc, args=(master, stop), daemon=True)
+        th.start()
+        try:
+            found, report = imu_recorder.find_mavlink_port(
+                candidates=[Path(slave_path)], timeout=1.2, log=lambda *a: None)
+            self.assertEqual(found, slave_path)
+            self.assertIn("GCS 心跳唤醒", report[slave_path])
+        finally:
+            stop.set()
+            th.join(timeout=2)
+            os.close(master)
+            os.close(slave)
+
+        # 2) ImuRecorder directly on the port also wakes it up
+        master, slave = pty.openpty()
+        slave_path = os.ttyname(slave)
+        _configure_raw(slave)
+        os.set_blocking(master, False)
+        stop = threading.Event()
+        th = threading.Thread(target=_fake_px4_fc, args=(master, stop), daemon=True)
+        th.start()
+        try:
+            rec = imu_recorder.ImuRecorder(slave_path, request_hz=100.0)
+            rec.start(wait_first_s=2.0)
+            time.sleep(0.3)
+            stats = rec.stop()
+            self.assertGreater(stats["samples"], 5)
+        finally:
+            stop.set()
+            th.join(timeout=2)
+            os.close(master)
+            os.close(slave)
+
     def test_gyro_motion_verdict(self):
         base = {"error": "", "samples": 1000, "mixed_instances": False, "instances": [0],
                 "timestamps_clamped": 0, "gaps_over_150ms": 0, "gaps_over_50ms": 0,

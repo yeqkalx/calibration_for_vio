@@ -176,11 +176,19 @@ def list_serial_candidates():
 
 
 def find_mavlink_port(candidates=None, timeout=1.5, baud=115200, log=print):
-    """在候选串口里逐个监听，返回第一个真的在讲 MAVLink 的口。"""
+    """在候选串口里逐个探测，返回第一个真的在讲 MAVLink 的口。
+
+    先被动监听一小段（兼容 ArduPilot 等主动发流的飞控）；若期间静默，
+    则发 GCS HEARTBEAT 唤醒等待地面站心跳的飞控（如 PX4 / MicoAir USB CDC）。
+    """
     candidates = list(candidates) if candidates else list_serial_candidates()
     if not candidates:
         return None, {}
-    log(f"串口候选 {[str(c) for c in candidates]}，逐个监听 {timeout:g}s 找 MAVLink……")
+    hb_v2 = pack(0, {"type": 6, "autopilot": 8, "system_status": 4, "mavlink_version": 3},
+                 sysid=255, compid=190, seq=0, version=2)
+    hb_v1 = pack(0, {"type": 6, "autopilot": 8, "system_status": 4, "mavlink_version": 3},
+                 sysid=255, compid=190, seq=1, version=1)
+    log(f"串口候选 {[str(c) for c in candidates]}，逐个探测 {timeout:g}s 找 MAVLink……")
     report = {}
     for path in candidates:
         try:
@@ -191,10 +199,31 @@ def find_mavlink_port(candidates=None, timeout=1.5, baud=115200, log=print):
             continue
         parser = MavlinkParser()
         seen = {}
-        deadline = time.monotonic() + timeout
+        t0 = time.monotonic()
+        deadline = t0 + timeout
+        wake_v2_at = t0 + min(0.35, timeout * 0.25)
+        wake_v1_at = t0 + min(0.85, timeout * 0.55)
+        sent_v2 = False
+        sent_v1 = False
         try:
-            while time.monotonic() < deadline:
-                r, _, _ = select.select([fd], [], [], 0.1)
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                if not seen:
+                    if not sent_v2 and now >= wake_v2_at:
+                        try:
+                            os.write(fd, hb_v2)
+                        except OSError:
+                            pass
+                        sent_v2 = True
+                    elif not sent_v1 and now >= wake_v1_at:
+                        try:
+                            os.write(fd, hb_v1)
+                        except OSError:
+                            pass
+                        sent_v1 = True
+                r, _, _ = select.select([fd], [], [], 0.05)
                 if not r:
                     continue
                 try:
@@ -206,8 +235,9 @@ def find_mavlink_port(candidates=None, timeout=1.5, baud=115200, log=print):
         finally:
             os.close(fd)
         if seen:
-            report[str(path)] = f"{sum(seen.values())} 帧 {sorted(seen)}"
-            log(f"  {path}: ✅ 收到 {sum(seen.values())} 帧 {sorted(seen)}")
+            woke = "（GCS 心跳唤醒）" if (sent_v2 or sent_v1) else ""
+            report[str(path)] = f"{sum(seen.values())} 帧{woke} {sorted(seen)}"
+            log(f"  {path}: ✅ 收到 {sum(seen.values())} 帧{woke} {sorted(seen)}")
             return str(path), report
         report[str(path)] = "没有有效 MAVLink 帧"
         log(f"  {path}: 静默（没有有效 MAVLink 帧）")
@@ -303,7 +333,9 @@ class ImuRecorder:
         next_request = 0.0
         ack_result = None
         tx_seq = 0
-        record_after = time.monotonic() + self.startup_discard_s
+        n_wake = 0
+        t_open = time.monotonic()
+        record_after = t_open + self.startup_discard_s
         last_time_usec = None
         last_ts = None
         instances = set()
@@ -336,6 +368,19 @@ class ImuRecorder:
                             }, version=version, seq=tx_seq))
                             tx_seq += 1
                             next_request = now + 2.0
+                    except OSError as exc:
+                        self._error = f"写串口失败: {exc}"
+                        return
+                elif now - t_open >= 0.3 and now >= next_heartbeat:
+                    # 唤醒等待 GCS HEARTBEAT 的飞控（如 PX4 / MicoAir USB CDC）
+                    wake_ver = 2 if (n_wake % 2 == 0) else 1
+                    try:
+                        os.write(self._fd, pack(0, {"type": 6, "autopilot": 8,
+                                                   "system_status": 4, "mavlink_version": 3},
+                                                version=wake_ver, seq=tx_seq))
+                        tx_seq += 1
+                        n_wake += 1
+                        next_heartbeat = now + 1.0
                     except OSError as exc:
                         self._error = f"写串口失败: {exc}"
                         return
