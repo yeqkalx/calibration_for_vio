@@ -23,6 +23,7 @@ APRILGRID_CLI_FIELDS = (
     "tag_spacing",
     "first_id",
     "tag_rotation_deg",
+    "black_border",
     "min_tags",
     "april_corner_window_px",
 )
@@ -69,6 +70,166 @@ def _check_float(value, name: str, *, allow_zero: bool = False) -> float:
         cond = "非负" if allow_zero else "正的"
         raise ValueError(f"{name} 必须是{cond}有限数，当前为 {value!r}")
     return result
+
+
+def _check_black_border(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm == "auto":
+            return None
+        if norm in ("1", "2"):
+            return int(norm)
+        raise ValueError(f"BLACK_BORDER 只能是 1、2 或 'auto'/None，当前为 {value!r}")
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (1, 2):
+        raise ValueError(f"BLACK_BORDER 只能是 1、2 或 'auto'/None，当前为 {value!r}")
+    return int(value)
+
+
+def _sample_bilinear(img: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """在浮点灰度图上做双线性插值（与 OpenCV 像素中心坐标系 (i, j) 对齐）。"""
+    x0 = np.floor(xs).astype(np.int32)
+    y0 = np.floor(ys).astype(np.int32)
+    dx = xs - x0
+    dy = ys - y0
+    return (
+        img[y0, x0] * (1.0 - dx) * (1.0 - dy)
+        + img[y0, x0 + 1] * dx * (1.0 - dy)
+        + img[y0 + 1, x0] * (1.0 - dx) * dy
+        + img[y0 + 1, x0 + 1] * dx * dy
+    )
+
+
+def _refine_border2_quad(
+    gray_u8: np.ndarray,
+    gray_f: np.ndarray,
+    quad: np.ndarray,
+    *,
+    tag_spacing: float,
+    subpix_win: int,
+) -> np.ndarray:
+    """精化 Kalibr 2-bit 黑边（10x10 码元）AprilTag 的四个外角点。
+
+    Kalibr AprilGrid 在每个 tag 四个外角放有小黑方块，OpenCV ArUco 二值化轮廓会在角点处
+    粘连并向内缩 5~10 px。这里先在四条外边中段（避开角块与内部 6x6 码元）做亚像素黑→白
+    边界采样并拟合四条外边直线求交，得到无内缩、抗强鱼眼畸变的精确外角点；若检测到该角点
+    外斜对角存在 Kalibr 小黑方块（X 形鞍点），再用受限 cornerSubPix 锁定到精确鞍点。
+    """
+    h, w = gray_f.shape
+    center = quad.mean(axis=0)
+    lines: list[tuple[float, float, float]] = []
+    edge_lengths: list[float] = []
+    eff_spacing = max(float(tag_spacing), 0.15)
+    fracs = np.linspace(0.22, 0.78, 17)
+
+    for k in range(4):
+        p0, p1 = quad[k], quad[(k + 1) % 4]
+        edge = p1 - p0
+        length = float(np.linalg.norm(edge))
+        edge_lengths.append(length)
+        if length < 12.0:
+            return quad
+        tangent = edge / length
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+        if np.dot(normal, 0.5 * (p0 + p1) - center) < 0.0:
+            normal = -normal
+
+        d_in = -max(3.0, 0.04 * length)
+        d_out = max(6.0, min(0.16 * length, (0.08 + 0.5 * eff_spacing) * length))
+        n_steps = max(25, int(round((d_out - d_in) * 2.0)) + 1)
+        ds = np.linspace(d_in, d_out, n_steps)
+
+        bases = p0[None, :] + fracs[:, None] * edge[None, :]  # (17, 2)
+        xs = bases[:, 0:1] + ds[None, :] * normal[0]         # (17, n_steps)
+        ys = bases[:, 1:2] + ds[None, :] * normal[1]         # (17, n_steps)
+        valid_mask = (xs >= 1.0) & (xs < w - 2.0) & (ys >= 1.0) & (ys < h - 2.0)
+        if not np.any(valid_mask):
+            return quad
+        xs_c = np.clip(xs, 1.0, w - 2.001)
+        ys_c = np.clip(ys, 1.0, h - 2.001)
+        prof_all = _sample_bilinear(gray_f, xs_c, ys_c)
+
+        pts = []
+        for row_idx in range(len(prof_all)):
+            idx_v = np.flatnonzero(valid_mask[row_idx])
+            if len(idx_v) < 8:
+                continue
+            row = prof_all[row_idx, idx_v]
+            d_row = ds[idx_v]
+            m_len = len(row)
+            i_dark_end = max(3, int(0.35 * m_len))
+            i_bright_start = min(m_len - 3, int(0.55 * m_len))
+            v_dark = float(np.min(row[:i_dark_end]))
+            v_bright = float(np.max(row[i_bright_start:]))
+            if v_bright - v_dark < 15.0:
+                continue
+            thresh = 0.5 * (v_dark + v_bright)
+            i_bright = i_bright_start + int(np.argmax(row[i_bright_start:]))
+            cross_idx = None
+            for j in range(i_bright - 1, -1, -1):
+                if row[j] <= thresh < row[j + 1]:
+                    cross_idx = j
+                    break
+            if cross_idx is None:
+                continue
+            denom = float(row[cross_idx + 1] - row[cross_idx])
+            alpha = (thresh - float(row[cross_idx])) / denom if denom > 1e-6 else 0.5
+            d_edge = float(d_row[cross_idx] + alpha * (d_row[cross_idx + 1] - d_row[cross_idx]))
+            pts.append(bases[row_idx] + d_edge * normal)
+
+        if len(pts) < 5:
+            return quad
+        pts_arr = np.asarray(pts, dtype=np.float32)
+        vx, vy, x0, y0 = cv2.fitLine(pts_arr, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        a, b = -float(vy), float(vx)
+        c = -(a * float(x0) + b * float(y0))
+        lines.append((a, b, c))
+
+    mean_len = float(np.mean(edge_lengths))
+    out = np.zeros((4, 2), dtype=np.float64)
+    for k in range(4):
+        a1, b1, c1 = lines[(k - 1) % 4]
+        a2, b2, c2 = lines[k]
+        det = a1 * b2 - a2 * b1
+        if abs(det) < 1e-9:
+            return quad
+        out[k, 0] = (b1 * c2 - b2 * c1) / det
+        out[k, 1] = (c1 * a2 - c2 * a1) / det
+        if np.linalg.norm(out[k] - quad[k]) > max(12.0, 0.35 * mean_len):
+            return quad
+
+    win = max(3, min(max(int(subpix_win), 5), int(round(0.08 * mean_len))))
+    probe_r = max(3.0, min(0.09, 0.35 * eff_spacing) * mean_len)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
+    max_shift = max(3.5, 0.06 * mean_len)
+
+    for k in range(4):
+        cx, cy = float(out[k, 0]), float(out[k, 1])
+        if cx < win + 2 or cx >= w - win - 2 or cy < win + 2 or cy >= h - win - 2:
+            continue
+        e_prev = out[k] - out[(k - 1) % 4]
+        e_next = out[k] - out[(k + 1) % 4]
+        u1 = e_prev / max(float(np.linalg.norm(e_prev)), 1e-6)
+        u2 = e_next / max(float(np.linalg.norm(e_next)), 1e-6)
+        p_in = out[k] - probe_r * (u1 + u2) * 0.6
+        p_out = out[k] + probe_r * (u1 + u2) * 0.6
+        p_w1 = out[k] + probe_r * (u1 - u2) * 0.6
+        p_w2 = out[k] + probe_r * (u2 - u1) * 0.6
+        probes = np.array([p_in, p_out, p_w1, p_w2], dtype=np.float64)
+        if (
+            (probes[:, 0] >= 1.0).all()
+            and (probes[:, 0] < w - 2.0).all()
+            and (probes[:, 1] >= 1.0).all()
+            and (probes[:, 1] < h - 2.0).all()
+        ):
+            v_in, v_out, v_w1, v_w2 = _sample_bilinear(gray_f, probes[:, 0], probes[:, 1])
+            if min(float(v_w1), float(v_w2)) - max(float(v_in), float(v_out)) > 15.0:
+                pt = np.array([[[cx, cy]]], dtype=np.float32)
+                ref = cv2.cornerSubPix(gray_u8, pt, (win, win), (-1, -1), crit)[0, 0].astype(np.float64)
+                if np.linalg.norm(ref - out[k]) <= max_shift:
+                    out[k] = ref
+    return out
 
 
 def normalize_target_type(value) -> str:
@@ -123,6 +284,7 @@ class CalibrationTarget:
         tag_spacing: float = 0.0,
         first_id: int = 0,
         tag_rotation_deg: int = 180,
+        black_border: int | str | None = None,
         min_tags: int = 4,
         april_corner_window_px: int = 4,
         source_yaml: Path | None = None,
@@ -144,10 +306,13 @@ class CalibrationTarget:
             self.tag_spacing = None
             self.first_id = None
             self.tag_rotation_deg = None
+            self.black_border = None
             self.roll = 0
             self.min_tags = None
             self.april_corner_window_px = None
             self.dictionary = None
+            self.border2_detector_params = None
+            self.border2_detector = None
             self.detector_params = None
             self.detector = None
             self.fallback_detector_params = None
@@ -161,6 +326,7 @@ class CalibrationTarget:
             if isinstance(tag_rotation_deg, bool) or not isinstance(tag_rotation_deg, int) or tag_rotation_deg not in (0, 90, 180, 270):
                 raise ValueError(f"TAG_ROTATION_DEG 只能是 0 / 90 / 180 / 270，当前为 {tag_rotation_deg!r}")
             self.tag_rotation_deg = int(tag_rotation_deg)
+            self.black_border = _check_black_border(black_border)
             self.roll = (self.tag_rotation_deg // 90) % 4
             self.min_tags = _check_int(min_tags, "APRILGRID_MIN_TAGS", 1)
             total_tags = self.cols * self.rows
@@ -184,22 +350,38 @@ class CalibrationTarget:
                     else cv2.aruco.DetectorParameters_create()
                 )
 
-            # 回退检测器（SUBPIX）：低对比度打印板在默认 (min=3, step=10) 下易漏检，
-            # 改为 min=5, step=4 (win 5,9,13,17,21) 后可稳定检出。
+            def _make_detector(params):
+                if params is None or not hasattr(cv2.aruco, "ArucoDetector"):
+                    return None
+                return cv2.aruco.ArucoDetector(dictionary, params)
+
+            # Kalibr 标准 AprilGrid（blackBorder=2，10x10 码元，含外角小黑块）检测器：
+            # markerBorderBits=2 在 1-bit 自拼板上严格零误检，因此 auto 模式下优先尝试 2-bit，
+            # 避免 OpenCV 4.7+ 的 CORNER_REFINE_APRILTAG(1-bit) 在 2-bit 板上误检出内缩 ~1 bit 的错误角框。
+            border2_params = _make_params()
+            border2_params.adaptiveThreshWinSizeMin = 5
+            border2_params.adaptiveThreshWinSizeStep = 4
+            border2_params.markerBorderBits = 2
+            border2_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+            self.border2_detector_params = border2_params
+            self.border2_detector = _make_detector(border2_params)
+
+            # 1-bit 黑边（8x8 码元，OpenCV generateImageMarker 自拼板）回退检测器（SUBPIX）：
+            # 低对比度打印板在默认 (min=3, step=10) 下易漏检，改为 min=5, step=4 后可稳定检出。
             subpix_params = _make_params()
             subpix_params.adaptiveThreshWinSizeMin = 5
             subpix_params.adaptiveThreshWinSizeStep = 4
+            subpix_params.markerBorderBits = 1
             subpix_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
             subpix_params.cornerRefinementWinSize = int(self.april_corner_window_px)
             subpix_params.cornerRefinementMaxIterations = 40
             subpix_params.cornerRefinementMinAccuracy = 0.01
 
-            # 主检测器优先使用 CORNER_REFINE_APRILTAG（AprilTag2 四边直线拟合求交）：
-            # 相比通用 cornerSubPix，在非鞍点的 L 型黑色 tag 角点上无内缩/半像素系统偏差，
-            # 实测重投影误差可从 ~0.5 px 降至 ~0.10-0.17 px，更适合内参 0.5 px 门槛。
-            # aprilTagQuadSigma=0.8 仅在四边分割阶段抑制噪声碎片，兼顾精度与速度。
+            # 1-bit 黑边主检测器优先使用 CORNER_REFINE_APRILTAG（AprilTag2 四边直线拟合求交）：
+            # 相比通用 cornerSubPix，在非鞍点的 L 型黑色 tag 角点上无内缩/半像素系统偏差。
             if hasattr(cv2.aruco, "CORNER_REFINE_APRILTAG"):
                 april_params = _make_params()
+                april_params.markerBorderBits = 1
                 april_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
                 april_params.aprilTagQuadDecimate = 0.0
                 april_params.aprilTagQuadSigma = 0.8
@@ -209,16 +391,8 @@ class CalibrationTarget:
                 self.detector_params = subpix_params
                 self.fallback_detector_params = None
 
-            self.detector = (
-                cv2.aruco.ArucoDetector(dictionary, self.detector_params)
-                if hasattr(cv2.aruco, "ArucoDetector")
-                else None
-            )
-            self.fallback_detector = (
-                cv2.aruco.ArucoDetector(dictionary, self.fallback_detector_params)
-                if (self.fallback_detector_params is not None and hasattr(cv2.aruco, "ArucoDetector"))
-                else None
-            )
+            self.detector = _make_detector(self.detector_params)
+            self.fallback_detector = _make_detector(self.fallback_detector_params)
             self.col_spacing_m = None
             self.row_spacing_m = None
             self.object_template = None
@@ -255,6 +429,7 @@ class CalibrationTarget:
         *,
         first_id: int = 0,
         tag_rotation_deg: int = 180,
+        black_border: int | str | None = None,
         min_tags: int = 4,
         april_corner_window_px: int = 4,
         source_yaml: Path | None = None,
@@ -267,6 +442,7 @@ class CalibrationTarget:
             tag_spacing=tag_spacing,
             first_id=first_id,
             tag_rotation_deg=tag_rotation_deg,
+            black_border=black_border,
             min_tags=min_tags,
             april_corner_window_px=april_corner_window_px,
             source_yaml=source_yaml,
@@ -305,6 +481,8 @@ class CalibrationTarget:
         tag_spacing = ov["tag_spacing"] if ov.get("tag_spacing") is not None else _require_mapping_key(entry, ("tagSpacing",), "tagSpacing")
         first_id = ov["first_id"] if ov.get("first_id") is not None else entry.get("first_id", 0)
         tag_rotation_deg = ov["tag_rotation_deg"] if ov.get("tag_rotation_deg") is not None else entry.get("tag_rotation_deg", 180)
+        yaml_border = entry.get("blackBorder", entry.get("black_border", None))
+        black_border = ov["black_border"] if ov.get("black_border") is not None else yaml_border
         min_tags = ov["min_tags"] if ov.get("min_tags") is not None else entry.get("min_tags", default_min_tags)
         corner_win = (
             ov["april_corner_window_px"]
@@ -318,6 +496,7 @@ class CalibrationTarget:
             tag_spacing=tag_spacing,
             first_id=first_id,
             tag_rotation_deg=tag_rotation_deg,
+            black_border=black_border,
             min_tags=min_tags,
             april_corner_window_px=corner_win,
             source_yaml=path,
@@ -342,7 +521,14 @@ class CalibrationTarget:
         roll = self.roll if rotation_deg is None else (int(rotation_deg) // 90) % 4
         return np.roll(quad, roll, axis=0) if roll else quad
 
-    def _run_aruco_detector(self, gray: np.ndarray, detector, params) -> Detection | None:
+    def _run_aruco_detector(
+        self,
+        gray: np.ndarray,
+        detector,
+        params,
+        *,
+        refine_border2: bool = False,
+    ) -> Detection | None:
         if detector is None:
             corners, ids, _ = cv2.aruco.detectMarkers(
                 gray, self.dictionary, parameters=params
@@ -357,7 +543,8 @@ class CalibrationTarget:
         april_origin_shift = (
             0.5
             if (
-                hasattr(cv2.aruco, "CORNER_REFINE_APRILTAG")
+                not refine_border2
+                and hasattr(cv2.aruco, "CORNER_REFINE_APRILTAG")
                 and params.cornerRefinementMethod == cv2.aruco.CORNER_REFINE_APRILTAG
             )
             else 0.0
@@ -380,6 +567,21 @@ class CalibrationTarget:
         if len(valid) < self.min_tags:
             return None
         valid.sort(key=lambda item: item[0])
+        if refine_border2:
+            gray_f = gray.astype(np.float64)
+            valid = [
+                (
+                    tag_id,
+                    _refine_border2_quad(
+                        gray,
+                        gray_f,
+                        quad,
+                        tag_spacing=self.tag_spacing,
+                        subpix_win=self.april_corner_window_px,
+                    ),
+                )
+                for tag_id, quad in valid
+            ]
         obj = np.concatenate([self.april_points(i) for i, _ in valid], axis=0).reshape(-1, 1, 3)
         img = np.concatenate([c for _, c in valid], axis=0).reshape(-1, 1, 2).astype(np.float64)
         tag_ids = np.array([i for i, _ in valid], dtype=np.int32)
@@ -410,6 +612,13 @@ class CalibrationTarget:
                 object_points=self.object_template.copy(),
                 image_points=corners.reshape(-1, 1, 2),
             )
+
+        if self.black_border in (None, 2):
+            det2 = self._run_aruco_detector(
+                gray, self.border2_detector, self.border2_detector_params, refine_border2=True
+            )
+            if det2 is not None or self.black_border == 2:
+                return det2
 
         det = self._run_aruco_detector(gray, self.detector, self.detector_params)
         if det is not None or self.fallback_detector_params is None:
@@ -531,10 +740,12 @@ class CalibrationTarget:
             else:
                 size_str = f"spacing={self.col_spacing_m:g}x{self.row_spacing_m:g}m"
             return f"棋盘格 {self.cols}x{self.rows} ({size_str})"
+        border_label = "auto" if self.black_border is None else str(self.black_border)
         return (
             f"AprilGrid {self.cols}x{self.rows} "
             f"(tagSize={self.tag_size_m:g}m, tagSpacing={self.tag_spacing:g}, "
-            f"first_id={self.first_id}, rot={self.tag_rotation_deg}°, min_tags={self.min_tags})"
+            f"first_id={self.first_id}, rot={self.tag_rotation_deg}°, "
+            f"border={border_label}, min_tags={self.min_tags})"
         )
 
     def summary_dict(self) -> dict:
@@ -557,6 +768,7 @@ class CalibrationTarget:
                 "tagSpacing": self.tag_spacing,
                 "first_id": self.first_id,
                 "tag_rotation_deg": self.tag_rotation_deg,
+                "blackBorder": "auto" if self.black_border is None else self.black_border,
                 "min_tags": self.min_tags,
                 "april_corner_window_px": self.april_corner_window_px,
             }
@@ -619,6 +831,8 @@ def add_target_arguments(parser: argparse.ArgumentParser) -> None:
                        help="[AprilGrid] 左下角起始 tag ID（默认 0）")
     group.add_argument("--tag-rotation-deg", type=int, choices=(0, 90, 180, 270), default=None,
                        help="[AprilGrid] 单 tag 旋转角：Kalibr PDF 板填 180，OpenCV 自拼板填 0")
+    group.add_argument("--black-border", choices=("auto", "1", "2"), default=None,
+                       help="[AprilGrid] 黑边框码元宽度：Kalibr 标准板为 2，OpenCV 自拼板为 1，auto 先试 2 再试 1")
     group.add_argument("--min-tags", type=_int_at_least(1), default=None,
                        help="[AprilGrid] 单帧最少检出 tag 数")
     group.add_argument("--april-corner-window-px", type=_int_at_least(1), default=None,
@@ -710,12 +924,17 @@ def build_target(
             tag_cols=overrides["tag_cols"] if overrides["tag_cols"] is not None else getattr(config, "TAG_COLS", 6),
             tag_rows=overrides["tag_rows"] if overrides["tag_rows"] is not None else getattr(config, "TAG_ROWS", 6),
             tag_size_m=overrides["tag_size"] if overrides["tag_size"] is not None else getattr(config, "TAG_SIZE_M", 0.088),
-            tag_spacing=overrides["tag_spacing"] if overrides["tag_spacing"] is not None else getattr(config, "TAG_SPACING", 0.56),
+            tag_spacing=overrides["tag_spacing"] if overrides["tag_spacing"] is not None else getattr(config, "TAG_SPACING", 0.3),
             first_id=overrides["first_id"] if overrides["first_id"] is not None else getattr(config, "FIRST_ID", 0),
             tag_rotation_deg=(
                 overrides["tag_rotation_deg"]
                 if overrides["tag_rotation_deg"] is not None
                 else getattr(config, "TAG_ROTATION_DEG", 180)
+            ),
+            black_border=(
+                overrides["black_border"]
+                if overrides["black_border"] is not None
+                else getattr(config, "BLACK_BORDER", None)
             ),
             min_tags=overrides["min_tags"] if overrides["min_tags"] is not None else default_min_tags,
             april_corner_window_px=(

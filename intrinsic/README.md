@@ -25,7 +25,7 @@
 在 [`calibration_config.py`](calibration_config.py) 顶部选择标定板类型并核对实测尺寸：
 - `TARGET_TYPE = "checkerboard"` 或 `"aprilgrid"`（也可将 `TARGET_YAML` 设为 `ROOT.parent / "extrinsic" / "configs" / "aprilgrid.yaml"` 直接复用外参配置）
 - **棋盘格**：核对 `COLS`、`ROWS`（**内角点数**，不是黑白格子数）与 `SQUARE_SIZE_M`（卡尺实测单格边长，米）
-- **AprilGrid**：核对 `TAG_COLS`、`TAG_ROWS`、`TAG_SIZE_M`（单个 tag 黑色外框边长，米）、`TAG_SPACING`（白隙 / `TAG_SIZE_M`）、`FIRST_ID`、`TAG_ROTATION_DEG`（**Kalibr PDF 打印板填 `180`，OpenCV `generateImageMarker` 自拼板填 `0`**）与 `APRILGRID_MIN_TAGS`
+- **AprilGrid**：核对 `TAG_COLS`、`TAG_ROWS`、`TAG_SIZE_M`（单个 tag 黑色外框边长，米）、`TAG_SPACING`（白隙 / `TAG_SIZE_M`）、`FIRST_ID`、`TAG_ROTATION_DEG`（**Kalibr PDF 打印板填 `180`，OpenCV `generateImageMarker` 自拼板填 `0`**）、`BLACK_BORDER`（**Kalibr 标准板填 `2`，OpenCV 自拼板填 `1`，`None` 为自动先试 `2` 再试 `1`**）与 `APRILGRID_MIN_TAGS`
 - `SESSION_NAME`（每次采集使用新名称，如 `"session01"`）
 - `WIDTH`、`HEIGHT`（须与后续外参标定及 VIO 运行分辨率一致）
 
@@ -56,8 +56,8 @@ python calibrate_intrinsics.py \
 python calibrate_intrinsics.py \
   --images data/session01/cam0 \
   --target-type aprilgrid \
-  --tag-cols 6 --tag-rows 6 --tag-size 0.088 --tag-spacing 0.56 \
-  --tag-rotation-deg 180 --min-tags 4 \
+  --tag-cols 6 --tag-rows 6 --tag-size 0.088 --tag-spacing 0.3 \
+  --tag-rotation-deg 180 --black-border 2 --min-tags 4 \
   --output data/session01/intrinsics
 
 # 方式 C：命令行指定棋盘格参数

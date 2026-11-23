@@ -26,10 +26,10 @@ import capture_calibration as cap_mod  # noqa: E402
 from target import CalibrationTarget, DuplicateTagError  # noqa: E402
 
 
-def _draw_aruco_marker(dictionary, tag_id: int, size_px: int) -> np.ndarray:
+def _draw_aruco_marker(dictionary, tag_id: int, size_px: int, *, border_bits: int = 1) -> np.ndarray:
     if hasattr(cv2.aruco, "generateImageMarker"):
-        return cv2.aruco.generateImageMarker(dictionary, tag_id, size_px)
-    return cv2.aruco.drawMarker(dictionary, tag_id, size_px)
+        return cv2.aruco.generateImageMarker(dictionary, tag_id, size_px, borderBits=border_bits)
+    return cv2.aruco.drawMarker(dictionary, tag_id, size_px, borderBits=border_bits)
 
 
 def _render_board_texture_checkerboard(cols: int, rows: int, square_size: float, ppm: float = 2500.0):
@@ -62,17 +62,21 @@ def _render_board_texture_aprilgrid(
     *,
     first_id: int = 0,
     tag_rotation_deg: int = 180,
+    black_border: int = 1,
+    corner_squares: bool = False,
     ppm: float = 2500.0,
 ):
     """生成高分辨率 Kalibr AprilGrid 纹理（board +X 向右，+Y 向上）。"""
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-    # tag36h11 为 8x8 码元（含 1-bit 黑框）；选用 160 的倍数可同时让常见 tagSpacing（如 0.35）的 pitch 为精确整数
-    tag_px = max(160, int(round(tag_size * ppm / 160.0)) * 160)
+    # 1-bit 为 8x8 码元，2-bit (Kalibr 标准) 为 10x10 码元；取 200 倍数可同时被 8/10 整除并让 0.30 间距为整数像素
+    unit_px = 200 if black_border == 2 else 160
+    tag_px = max(unit_px, int(round(tag_size * ppm / float(unit_px))) * unit_px)
     ppm = tag_px / tag_size
     pitch_m = tag_size * (1.0 + tag_spacing)
+    gap_px = int(round(tag_size * tag_spacing * ppm))
     board_w_m = (tag_cols - 1) * pitch_m + tag_size
     board_h_m = (tag_rows - 1) * pitch_m + tag_size
-    margin_m = tag_size * 0.6
+    margin_m = tag_size * max(0.6, tag_spacing + 0.3)
     margin_px = int(round(margin_m * ppm))
     tex_w = int(round(board_w_m * ppm)) + 2 * margin_px
     tex_h = int(round(board_h_m * ppm)) + 2 * margin_px
@@ -86,7 +90,7 @@ def _render_board_texture_aprilgrid(
     for row in range(tag_rows):
         for col in range(tag_cols):
             tag_id = first_id + row * tag_cols + col
-            marker = _draw_aruco_marker(dictionary, tag_id, tag_px)
+            marker = _draw_aruco_marker(dictionary, tag_id, tag_px, border_bits=black_border)
             if k_rot:
                 marker = np.rot90(marker, k_rot)
             x_m = col * pitch_m
@@ -94,6 +98,15 @@ def _render_board_texture_aprilgrid(
             x0 = int(round(origin_x + 0.5 + x_m * ppm))
             y0 = int(round(origin_y + 0.5 - y_top_m * ppm))
             tex[y0:y0 + tag_px, x0:x0 + tag_px] = marker
+
+    if corner_squares and gap_px > 0:
+        for row in range(tag_rows + 1):
+            for col in range(tag_cols + 1):
+                x_m = col * pitch_m - tag_size * tag_spacing
+                y_top_m = row * pitch_m
+                x0 = int(round(origin_x + 0.5 + x_m * ppm))
+                y0 = int(round(origin_y + 0.5 - y_top_m * ppm))
+                tex[y0:y0 + gap_px, x0:x0 + gap_px] = 0
 
     return tex, (origin_x, origin_y, ppm, -1.0)
 
@@ -176,8 +189,9 @@ class IntrinsicTargetTests(unittest.TestCase):
         self.assertEqual(t_april.kind, "aprilgrid")
         self.assertEqual((t_april.cols, t_april.rows), (6, 6))
         self.assertAlmostEqual(t_april.tag_size_m, 0.088)
-        self.assertAlmostEqual(t_april.tag_spacing, 0.56)
+        self.assertAlmostEqual(t_april.tag_spacing, 0.3)
         self.assertEqual(t_april.tag_rotation_deg, 180)
+        self.assertEqual(t_april.black_border, 2)
 
         t_checker = CalibrationTarget.from_yaml(checker_yaml)
         self.assertEqual(t_checker.kind, "checkerboard")
@@ -715,6 +729,89 @@ class IntrinsicTargetTests(unittest.TestCase):
         finally:
             cfg.TARGET_TYPE = orig_type
             cfg.TARGET_YAML = orig_yaml
+
+    def test_end_to_end_kalibr_border2_aprilgrid_with_corner_squares(self):
+        """端到端合成测试：标准 Kalibr 2-bit 黑边 + 外角小黑方块 AprilGrid（pinhole 与 fisheye）。"""
+        tag_cols, tag_rows, tag_size, tag_spacing = 5, 5, 0.06, 0.3
+        tex, meta = _render_board_texture_aprilgrid(
+            tag_cols, tag_rows, tag_size, tag_spacing,
+            tag_rotation_deg=180, black_border=2, corner_squares=True, ppm=2500.0,
+        )
+        pitch = tag_size * (1.0 + tag_spacing)
+        board_span = (tag_cols - 1) * pitch + tag_size
+        center = np.array([board_span / 2.0, board_span / 2.0, 0.0])
+
+        image_size = (960, 720)
+        k_true = np.array([[780.0, 0.0, 484.0], [0.0, 782.0, 356.0], [0.0, 0.0, 1.0]])
+        d_true = np.array([0.08, -0.14, 0.001, -0.001, 0.0])
+        poses = [
+            ((0, 0, 0), (0.0, 0.0), 0.72),
+            ((24, 0, 4), (0.0, -0.12), 0.72),
+            ((-24, 0, -4), (0.0, 0.12), 0.72),
+            ((0, 24, 4), (-0.14, 0.0), 0.72),
+            ((0, -24, -4), (0.14, 0.0), 0.72),
+            ((18, 18, 20), (-0.14, -0.10), 0.76),
+            ((-18, -18, -20), (0.14, 0.10), 0.76),
+            ((18, -18, -25), (0.14, -0.10), 0.76),
+            ((-18, 18, 25), (-0.14, 0.10), 0.76),
+            ((28, 8, 12), (-0.08, 0.06), 0.66),
+            ((-28, -8, -12), (0.08, -0.06), 0.66),
+            ((8, -28, 18), (0.10, 0.08), 0.68),
+            ((-8, 28, -18), (-0.10, -0.08), 0.68),
+            ((16, -20, 35), (0.0, 0.0), 0.80),
+            ((-16, 20, -35), (0.0, 0.0), 0.80),
+            ((22, 14, -15), (-0.16, 0.08), 0.70),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img_dir = root / "cam0"
+            out_dir = root / "intrinsics_border2"
+            img_dir.mkdir()
+            for idx, (euler, shift, dist_z) in enumerate(poses):
+                rvec, tvec = _aprilgrid_pose(center, euler, shift, dist_z)
+                img = _render_view(tex, meta, image_size, k_true, d_true, rvec, tvec, model="pinhole")
+                cv2.imwrite(str(img_dir / f"frame_{idx:03d}.png"), img)
+
+            # auto 模式应先走 2-bit 检测并精化外角 X 形鞍点，不退化到 1-bit 内缩框
+            report = calib.main([
+                "--images", str(img_dir),
+                "--target-type", "aprilgrid",
+                "--tag-cols", str(tag_cols),
+                "--tag-rows", str(tag_rows),
+                "--tag-size", str(tag_size),
+                "--tag-spacing", str(tag_spacing),
+                "--tag-rotation-deg", "180",
+                "--black-border", "auto",
+                "--min-tags", "4",
+                "--min-views", "12",
+                "--no-save-detections",
+                "--output", str(out_dir),
+            ])
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["views_detected"], len(poses))
+            self.assertLess(report["reprojection_rms_px"], 0.25)
+            k_est = np.array(report["camera_matrix"])
+            self.assertAlmostEqual(k_est[0, 0], k_true[0, 0], delta=4.0)
+            self.assertAlmostEqual(k_est[1, 1], k_true[1, 1], delta=4.0)
+            self.assertAlmostEqual(k_est[0, 2], k_true[0, 2], delta=2.0)
+            self.assertAlmostEqual(k_est[1, 2], k_true[1, 2], delta=2.0)
+
+        # 同时验证无小黑角块的 2-bit 板（L 角点）走纯外边直线求交也能无偏定位
+        tex_no_sq, meta_no_sq = _render_board_texture_aprilgrid(
+            4, 4, 0.06, 0.3, tag_rotation_deg=180, black_border=2, corner_squares=False, ppm=2500.0,
+        )
+        t_b2 = CalibrationTarget.from_aprilgrid(4, 4, 0.06, 0.3, tag_rotation_deg=180, black_border=2)
+        pitch4 = 0.06 * 1.3
+        c4 = np.array([1.5 * pitch4 + 0.03, 1.5 * pitch4 + 0.03, 0.0])
+        rvec, tvec = _aprilgrid_pose(c4, (14, -12, 8), (0.0, 0.0), 0.72)
+        img_no_sq = _render_view(tex_no_sq, meta_no_sq, image_size, k_true, np.zeros(5), rvec, tvec, model="pinhole")
+        det = t_b2.detect(img_no_sq)
+        self.assertIsNotNone(det)
+        self.assertEqual(det.num_tags, 16)
+        proj, _ = cv2.projectPoints(det.object_points, rvec, tvec, k_true, np.zeros(5))
+        err = np.linalg.norm(proj.reshape(-1, 2) - det.image_points.reshape(-1, 2), axis=1)
+        self.assertLess(float(np.sqrt(np.mean(err ** 2))), 0.30)
 
 
 if __name__ == "__main__":
