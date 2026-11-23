@@ -548,10 +548,7 @@ def timebase_report(t, log=print):
     if len(d) == 0:
         raise SystemExit("时间戳没有严格递增的部分，无法分析")
     med = float(np.median(d))
-    fs = 1.0 / med
     jitter = float(np.std(d) / med)
-    log(f"  时间基准    {len(t):,} 样本，跨度 {t[-1]:.1f} s")
-    log(f"  采样间隔    中位 {med * 1e3:.4f} ms → {fs:.2f} Hz；抖动 {jitter:.2%}")
     dt_all = np.diff(t)
     gaps = np.where(dt_all > GAP_FACTOR * med)[0]
     segs, bounds = [], [0] + [int(g) + 1 for g in gaps] + [len(t)]
@@ -559,7 +556,17 @@ def timebase_report(t, log=print):
         a, b = bounds[i], bounds[i + 1]
         if b - a > 1:
             segs.append((a, b, t[b - 1] - t[a]))
+    if not segs:
+        raise SystemExit("没有长度 > 1 的连续时间段，无法分析")
     segs.sort(key=lambda s: -s[2])
+    a0, b0, dur0 = segs[0]
+    # 用最长无缝隙段的【平均采样率】而非 1/median(dt)：
+    # 飞控调度周期与请求周期不成整数倍时（如 3.74/7.47 ms 交替），中位间隔偏向短档，
+    # 用 1/median(dt) 会高估 fs，导致 Allan 簇时间 τ 偏小、σ 系统性偏低 √(fs_mean/fs_med)。
+    fs = float((b0 - a0 - 1) / dur0) if dur0 > 0 else (1.0 / med)
+    log(f"  时间基准    {len(t):,} 样本，跨度 {t[-1]:.1f} s")
+    log(f"  采样间隔    中位 {med * 1e3:.4f} ms（{1.0 / med:.2f} Hz）；"
+        f"最长段平均 {1e3 / fs:.4f} ms → 实际速率 {fs:.2f} Hz；抖动 {jitter:.2%}")
     if gaps.size:
         log(f"  缝隙        {gaps.size} 处（>{GAP_FACTOR:g}× 中位间隔），按缝隙切成 {len(segs)} 段")
     log(f"  用最长段    {segs[0][2]:.1f} s / {segs[0][1] - segs[0][0]:,} 样本"
