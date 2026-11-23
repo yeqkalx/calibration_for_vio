@@ -28,6 +28,13 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import calibration_config as config
+from target import (
+    CalibrationTarget,
+    Detection,
+    DuplicateTagError,
+    add_target_arguments,
+    build_target,
+)
 
 
 EXPECTED_VENDOR, EXPECTED_PRODUCT = "2bc5", "0511"
@@ -758,8 +765,7 @@ def arguments(argv=None):
     parser.add_argument("--allow-dark", action="store_true", default=config.ALLOW_DARK,
                         help="测光不达标也硬录（数据大概率发散，只用于排查）")
     parser.add_argument("--power-line-frequency", type=int, choices=(0, 1, 2), default=config.POWER_LINE_FREQUENCY)
-    parser.add_argument("--cols", type=positive_int, default=config.COLS, help="横向内角点数，必须和实物一致")
-    parser.add_argument("--rows", type=positive_int, default=config.ROWS, help="纵向内角点数，必须和实物一致")
+    add_target_arguments(parser)
     parser.add_argument("--auto-interval", type=nonnegative_float, default=config.AUTO_INTERVAL,
                         help="自动存图间隔秒；0=只用空格键存图")
     parser.add_argument("--duration", type=nonnegative_float, default=config.DURATION,
@@ -773,66 +779,52 @@ def arguments(argv=None):
     parser.add_argument("--retry-interval", type=nonnegative_float, default=config.RETRY_INTERVAL)
     parser.add_argument("--warmup-frames", type=int, default=config.WARMUP_FRAMES)
     args = parser.parse_args(argv)
-    if (args.cols is None) != (args.rows is None):
-        parser.error("--cols 与 --rows 必须同时提供")
     if args.no_preview and args.duration == 0 and (args.max_images == 0 or args.auto_interval == 0):
         parser.error("--no-preview 需要 --duration，或同时设置 --auto-interval 与 --max-images")
     if args.max_images < 0:
         parser.error("--max-images 不能为负数")
-    if not isinstance(args.warmup_frames, int) or args.warmup_frames < 0:
+    if isinstance(args.warmup_frames, bool) or not isinstance(args.warmup_frames, int) or args.warmup_frames < 0:
         parser.error("--warmup-frames 必须为非负整数")
-    for name in ("width", "height", "fps", "exposure", "white_balance", "read_retries", "cols", "rows"):
+    for name in ("width", "height", "fps", "exposure", "white_balance", "read_retries"):
         value = getattr(args, name)
-        if not isinstance(value, int) or value < (2 if name in ("cols", "rows") else 1):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             parser.error(f"{name} 默认值无效，请检查配置文件")
     for name in ("auto_interval", "duration", "retry_interval"):
         if not 0 <= getattr(args, name) < float("inf"):
             parser.error(f"{name} 必须非负且有限")
     if args.backend not in ("auto", "v4l2", "opencv") or args.power_line_frequency not in (0, 1, 2):
         parser.error("BACKEND 或 POWER_LINE_FREQUENCY 配置无效")
+    args.target_spec = build_target(args, config, error_fn=parser.error)
     return args
 
 
 def detect_board(gray, cols, rows):
-    """和离线标定 calibrate_intrinsics.find_corners 保持一致的检测策略。
-
-    原实现只试 findChessboardCornersSB，失败即返回 None。SB 虽然精确，
-    但在真实拍摄条件下（轻微模糊、反光、对比度低、板子偏远）比经典检测器
-    更容易漏检，导致预览不显示绿点，而同一张图离线标定时其实能被经典
-    检测器找到 —— 用户会误以为这张图不能用。
-
-    这里补上经典检测器回退，使预览所见与离线标定结果一致。
-    """
-    pattern = (cols, rows)
-    if hasattr(cv2, "findChessboardCornersSB"):
-        # [2026-10-15 修复，见 vendor/PROVENANCE.md]
-        # 原来写的是位置参数：cv2.findChessboardCornersSB(gray, pattern, cv2.CALIB_CB_NORMALIZE_IMAGE)
-        # 但 Python 签名是 f(image, patternSize[, corners[, flags]]) —— 第 3 个位置参数是
-        # **输出数组 corners**，不是 flags。OpenCV 不报错、静默接受，flags 实际用默认值 0，
-        # 于是丢掉了 NORMALIZE_IMAGE（直方图归一化）。
-        # 后果：暗光/低对比度下图全检不出，而离线标定程序（用 flags= 关键字，正确）能检出 ——
-        # 预览和 board_detected 会一直报 no，把人误导成"板子有问题"。
-        # 实测：同一批图，flags=0 检出 0/12，flags=NORMALIZE_IMAGE 检出 10/12。
-        found, corners = cv2.findChessboardCornersSB(
-            gray, pattern, flags=cv2.CALIB_CB_NORMALIZE_IMAGE)
-        if found:
-            return corners
-    flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-    found, corners = cv2.findChessboardCorners(gray, pattern, flags)
-    if not found:
-        return None
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-3)
-    return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+    """兼容旧接口：和离线标定一致的棋盘格检测策略。"""
+    det = CalibrationTarget.from_checkerboard(cols, rows, 1.0).detect(gray)
+    return None if det is None else det.image_points
 
 
-def preview_image(frame, corners, stats, covered):
+def _detect_target(target, gray):
+    """安全调用 target.detect：重复 AprilTag ID 时不中断实时采集，仅返回告警文本。"""
+    try:
+        return target.detect(gray), None
+    except DuplicateTagError as exc:
+        print(f"警告: {exc}", file=sys.stderr)
+        return None, "DUP TAG ID!"
+
+
+def preview_image(frame, detection, stats, covered, target=None):
     height, width = frame.shape[:2]
     scale = min(1.0, 960.0 / width)
     canvas = cv2.resize(frame, (round(width * scale), round(height * scale))) if scale < 1 else frame.copy()
-    if corners is not None:
-        for point in corners.reshape(-1, 2):
-            x, y = point * scale
-            cv2.circle(canvas, (round(x), round(y)), 2, (0, 255, 0), -1)
+    if detection is not None:
+        if isinstance(detection, Detection) and target is not None:
+            target.draw_detection(canvas, detection, scale=scale, for_preview=True)
+        else:
+            pts = detection.image_points if isinstance(detection, Detection) else detection
+            for point in pts.reshape(-1, 2):
+                x, y = point * scale
+                cv2.circle(canvas, (round(x), round(y)), 2, (0, 255, 0), -1)
     if covered is not None:
         for row in range(3):
             for col in range(3):
@@ -899,7 +891,9 @@ class PreviewWindow:
 
 def main(argv=None):
     args = arguments(argv)
+    target = args.target_spec
     device = identify_camera(args.device)
+    print(f"标定板: {target.describe()}")
     output = args.output.expanduser().resolve()
     camera_dir = output / "cam0"
     if (camera_dir.exists() and any(camera_dir.glob("*.png"))) or (output / "capture_manifest.json").exists():
@@ -918,7 +912,8 @@ def main(argv=None):
     first_frame_time = last_frame_time = None
     recent_times = deque(maxlen=60)
     last_save_time = last_detect_time = 0.0
-    corners = None
+    detection = None
+    detect_warning = None
     covered = set()
     warmup_remaining = args.warmup_frames
     try:
@@ -1039,22 +1034,31 @@ def main(argv=None):
             recent_times.append(now)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             # [2026-10-18 修改] 和下面"保存时检测"同一个毛病：连续录像（--no-preview）时
-            # 这个每 0.5 秒一次的棋盘检测在 1080p 上要 470~530 ms，把 29 fps 拖成 11 fps，
-            # 而且制造 330~400 ms 的驱动级空洞（直接触发标定侧 max_camera_gap_s=0.35）。
-            # 它只给预览窗绿点和 3x3 覆盖度用，录像时不需要。
-            if args.cols and not args.no_preview and (frames == 1 or now - last_detect_time >= 0.5):
-                corners = detect_board(gray, args.cols, args.rows)
+            # 这个每 0.5 秒一次的标定板检测在 1080p 上很耗时，会把帧率拖低，
+            # 而且制造驱动级空洞。它只给预览窗绿点/tag框和 3x3 覆盖度用，无预览录像时不需要。
+            if not args.no_preview and (frames == 1 or now - last_detect_time >= 0.5):
+                detection, detect_warning = _detect_target(target, gray)
                 last_detect_time = now
             measured_fps = ((len(recent_times)-1) / (recent_times[-1]-recent_times[0])
                             if len(recent_times) > 1 and recent_times[-1] > recent_times[0] else 0)
             key = -1
             if not args.no_preview:
-                board_state = ("N/A" if args.cols is None else
-                               "YES" if corners is not None else "NO")
+                if detect_warning:
+                    board_state = detect_warning
+                elif detection is None:
+                    board_state = (
+                        "NO" if target.kind == "checkerboard"
+                        else f"NO (<{target.min_tags} tags)"
+                    )
+                elif target.kind == "aprilgrid":
+                    px_part = f" ({detection.tag_px:.0f}px)" if detection.tag_px else ""
+                    board_state = f"{detection.num_tags} tags{px_part}"
+                else:
+                    board_state = "YES"
                 lines = [f"{args.width}x{args.height} MJPG | read {measured_fps:.1f} fps | saved {len(saved)}",
-                         f"Exposure {settings['exposure']} (100us) Gain {settings['gain']} chessboard {args.cols}x{args.rows}: {board_state}",
-                         "SPACE: save   Q: quit" + ("   green dots: covered regions" if args.cols else "") ]
-                key = preview.show(preview_image(frame, corners, lines, covered if args.cols else None))
+                         f"Exposure {settings['exposure']} (100us) Gain {settings['gain']} {target.short_label()}: {board_state}",
+                         "SPACE: save   Q: quit   green dots: covered regions"]
+                key = preview.show(preview_image(frame, detection, lines, covered, target=target))
             if key in (ord('q'), ord('Q')):
                 termination = "user_stopped"
                 break
@@ -1062,12 +1066,9 @@ def main(argv=None):
             if key == 32 or automatic:
                 # Re-detect on the exact frame being written, not a previous preview frame.
                 # [2026-10-15 修改，见 vendor/PROVENANCE.md] 只在开着预览时做。
-                # 这个检测是给预览窗的绿点和 3x3 覆盖度用的；连续录像（--no-preview）时
-                # 它对每一帧都跑一次完整棋盘检测（1080p 上 180~330 ms），
-                # 会把帧率从 ~19 fps 拖到 ~2.6 fps（实测 9.23 秒只存下 25 张）。
-                # 外参标定不需要它 —— 角点由离线标定程序自己检测。
-                if args.cols and not args.no_preview:
-                    corners = detect_board(gray, args.cols, args.rows)
+                # 这个检测是给预览窗和 3x3 覆盖度用的；无预览连续录像时不跑检测以保帧率。
+                if not args.no_preview:
+                    detection, detect_warning = _detect_target(target, gray)
                     last_detect_time = now
                 dest = camera_dir / f"{timestamp_ns}.png"
                 if dest.exists():
@@ -1076,13 +1077,26 @@ def main(argv=None):
                 if not ok:
                     raise OSError(f"PNG 编码失败: {dest}")
                 encoded.tofile(str(dest))
-                saved.append({"file": str(dest.relative_to(output)), **metadata,
-                              "board_detected": corners is not None})
+                save_entry = {"file": str(dest.relative_to(output)), **metadata,
+                              "board_detected": detection is not None}
+                if target.kind == "aprilgrid":
+                    save_entry["tags_detected"] = 0 if detection is None else detection.num_tags
+                    save_entry["median_tag_px"] = (
+                        None if detection is None or detection.tag_px is None
+                        else round(detection.tag_px, 2)
+                    )
+                saved.append(save_entry)
                 last_save_time = now
-                if corners is not None:
-                    for x, y in corners.reshape(-1, 2):
-                        covered.add((min(2, int(3*x/args.width)), min(2, int(3*y/args.height))))
-                print(f"保存 {dest} (board={'yes' if corners is not None else 'no'})")
+                if detection is not None:
+                    for x, y in detection.image_points.reshape(-1, 2):
+                        cx = max(0, min(2, int(3 * x / args.width)))
+                        cy = max(0, min(2, int(3 * y / args.height)))
+                        covered.add((cx, cy))
+                if target.kind == "aprilgrid" and detection is not None:
+                    px_info = f", tag_px={detection.tag_px:.1f}" if detection.tag_px else ""
+                    print(f"保存 {dest} (board=yes, tags={detection.num_tags}{px_info})")
+                else:
+                    print(f"保存 {dest} (board={'yes' if detection is not None else 'no'})")
             if args.duration and now - start >= args.duration:
                 break
             if args.max_images and len(saved) >= args.max_images:
@@ -1135,7 +1149,10 @@ def main(argv=None):
                        "last_frame_timestamp_metadata": last_metadata,
                        "filename_timestamp_source": "host_receive_time_ns_unix",
                        "usable_for_camera_imu_time_calibration": False,
-                       "board_inner_corners": [args.cols, args.rows],
+                       "target_type": target.kind,
+                       "target": target.summary_dict(),
+                       "board_inner_corners": ([target.cols, target.rows]
+                                               if target.kind == "checkerboard" else None),
                        # 【2026-10-20】不记这个数，外面用
                        # (末尾 v4l2_sequence + 1 - frames_read) 算"丢帧"会
                        # 恰好多出 warmup-1，看起来像相机丢帧。
